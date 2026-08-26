@@ -350,7 +350,7 @@ bool ggml_cuda_halo_mmvq_supported(
             HALO_REJ("lds");
         }
     } else {
-        if (getenv("HALO_DENSE") == nullptr) {
+        if (getenv("HALO_DENSE_DISABLE") != nullptr) {
             return false;
         }
         if (dst->ne[1] != 1 || dst->ne[2] != 1 || src0->ne[2] != 1) {
