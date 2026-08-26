@@ -238,13 +238,23 @@ static __global__ void halo_mmv_q6k(
         // rows are 16B-aligned (host guarantees); block sb starts at byte off=210*sb.
         // Load the covering aligned 224B window, rotate left by (off & 15) bytes.
         const int      off  = sb*210;
+        uint32_t img[53];
+        if (((uintptr_t) base & 15) != 0 || false) {
+            // unaligned row: safe 2B loads (small latency-bound ops only)
+#pragma unroll
+            for (int i = 0; i < 52; ++i) {
+                const uint16_t lo16 = ((const uint16_t *)(base + off))[2*i];
+                const uint16_t hi16 = ((const uint16_t *)(base + off))[2*i + 1];
+                img[i] = (uint32_t) lo16 | ((uint32_t) hi16 << 16);
+            }
+            img[52] = (uint32_t) ((const uint16_t *)(base + off))[104];
+        } else {
         const uint4  * rp4  = (const uint4 *) base;
         uint4 wbuf[14];
 #pragma unroll
         for (int i = 0; i < 14; ++i) {
             wbuf[i] = rp4[(off >> 4) + i];
         }
-        uint32_t img[53];
         {
             const uint32_t * in = (const uint32_t *) wbuf;
             const int skip = (off & 15) >> 2;        // whole words
@@ -258,6 +268,7 @@ static __global__ void halo_mmv_q6k(
                     img[i] = (in[i + skip] >> shb) | (in[i + skip + 1] << (32 - shb));
                 }
             }
+        }
         }
         const uint32_t * ql32 = img;                             // 32 words
         const uint32_t * qh32 = img + 32;                        // 16 words
@@ -305,6 +316,173 @@ static __global__ void halo_mmv_q6k(
     }
     dst[(int64_t) c*stride_ch_dst + row] = acc;
 }
+
+// ---------------- fused QKV kernel (q4,q4,q6 / all-q4) ----------------
+// Three matvecs sharing one activation vector, one launch. Row ranges map to
+// tensors: [0,r0) -> W0/dst0, [r0,r1) -> W1/dst1, [r1,r2) -> W2/dst2.
+template <int NSB, bool V_IS_Q6>
+static __global__ void halo_mmv_qkv(
+        const void * __restrict__ w0, const void * __restrict__ w1, const void * __restrict__ w2,
+        const float * __restrict__ y,
+        float * __restrict__ d0, float * __restrict__ d1, float * __restrict__ d2,
+        const int r0, const int r1, const int r2,
+        const int64_t srb0, const int64_t srb1, const int64_t srb2) {
+    __shared__ int8_t syq[NSB*256];
+    __shared__ float  syd[NSB*8];
+    __shared__ float  ysm[NSB*8];
+    __shared__ float  ysm16[NSB*16];
+    for (int s = threadIdx.x; s < NSB*8; s += HALO_WG) {
+        float amax = 0.f, s0 = 0.f, s1 = 0.f;
+#pragma unroll
+        for (int l = 0; l < 16; ++l) {
+            const float v = y[s*32 + l];
+            amax = fmaxf(amax, fabsf(v)); s0 += v;
+        }
+#pragma unroll
+        for (int l = 16; l < 32; ++l) {
+            const float v = y[s*32 + l];
+            amax = fmaxf(amax, fabsf(v)); s1 += v;
+        }
+        const float dq = amax / 127.f;
+        syd[s] = dq; ysm[s] = s0 + s1; ysm16[2*s] = s0; ysm16[2*s + 1] = s1;
+        const float inv = dq > 0.f ? 1.f/dq : 0.f;
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            syq[s*32 + l] = (int8_t) lrintf(y[s*32 + l] * inv);
+        }
+    }
+    __syncthreads();
+
+    const int row = blockIdx.x*HALO_WG + threadIdx.x;
+    if (row >= r2) {
+        return;
+    }
+    const int t = row < r0 ? 0 : (row < r1 ? 1 : 2);
+    const int lrow = t == 0 ? row : (t == 1 ? row - r0 : row - r1);
+    const uint8_t * base = (const uint8_t *)(t == 0 ? w0 : (t == 1 ? w1 : w2))
+                         + (int64_t) lrow * (t == 0 ? srb0 : (t == 1 ? srb1 : srb2));
+    float * dst = t == 0 ? d0 : (t == 1 ? d1 : d2);
+
+    float acc = 0.f;
+    if (!V_IS_Q6 || t < 2) {
+        const uint4 * bx = (const uint4 *) base;
+        uint4 wA[9], wB[9];
+#pragma unroll
+        for (int i = 0; i < 9; ++i) { wA[i] = bx[i]; }
+        for (int sb = 0; sb < NSB; ++sb) {
+            if (sb + 1 < NSB) {
+#pragma unroll
+                for (int i = 0; i < 9; ++i) { wB[i] = bx[(sb+1)*9 + i]; }
+            }
+            const uint8_t  * raw    = (const uint8_t  *) wA;
+            const float      d      = __half2float(((const __half *) raw)[0]);
+            const float      dmin   = __half2float(((const __half *) raw)[1]);
+            const uint8_t  * scales = raw + 4;
+            const uint32_t * qs32   = (const uint32_t *)(raw + 16);
+            const uint32_t * yq     = (const uint32_t *) &syq[sb*256];
+            int isum[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { isum[j] = 0; }
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+#pragma unroll
+                for (int tt = 0; tt < 8; ++tt) {
+                    const uint32_t q = qs32[g*8 + tt];
+                    isum[2*g]   = halo_dot4( q       & 0x0F0F0F0Fu, (int) yq[(2*g)*8   + tt], isum[2*g]);
+                    isum[2*g+1] = halo_dot4((q >> 4) & 0x0F0F0F0Fu, (int) yq[(2*g+1)*8 + tt], isum[2*g+1]);
+                }
+            }
+            float sMul = 0.f, sMin = 0.f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float sc, mn; halo_scale_min(j, scales, sc, mn);
+                sMul = fmaf(sc * syd[sb*8 + j], (float) isum[j], sMul);
+                sMin = fmaf(mn, ysm[sb*8 + j], sMin);
+            }
+            acc += d*sMul - dmin*sMin;
+#pragma unroll
+            for (int i = 0; i < 9; ++i) { wA[i] = wB[i]; }
+        }
+    } else {
+        for (int sb = 0; sb < NSB; ++sb) {
+            const int off = sb*210;
+            const uint4 * rp4 = (const uint4 *) base;
+            uint4 wbuf[14];
+#pragma unroll
+            for (int i = 0; i < 14; ++i) { wbuf[i] = rp4[(off >> 4) + i]; }
+            uint32_t img[53];
+            {
+                const uint32_t * in = (const uint32_t *) wbuf;
+                const int skip = (off & 15) >> 2;
+                const int shb  = (off & 3) * 8;
+                if (shb == 0) {
+#pragma unroll
+                    for (int i = 0; i < 53; ++i) { img[i] = in[i + skip]; }
+                } else {
+#pragma unroll
+                    for (int i = 0; i < 53; ++i) { img[i] = (in[i + skip] >> shb) | (in[i + skip + 1] << (32 - shb)); }
+                }
+            }
+            const uint32_t * ql32 = img;
+            const uint32_t * qh32 = img + 32;
+            const int8_t   * sc   = (const int8_t *)(img + 48);
+            const float      d    = __half2float(*(const __half *)((const uint8_t *) img + 208));
+            const uint32_t * yq = (const uint32_t *) &syq[sb*256];
+            const float    * yd = &syd[sb*8];
+            const float    * ys = &ysm16[sb*16];
+            float bacc = 0.f;
+#pragma unroll
+            for (int n = 0; n < 2; ++n) {
+                int isum[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { isum[j] = 0; }
+#pragma unroll
+                for (int tt = 0; tt < 8; ++tt) {
+                    const uint32_t ql0   = ql32[n*16 + tt];
+                    const uint32_t ql32b = ql32[n*16 + 8 + tt];
+                    const uint32_t qh0   = qh32[n*8 + tt];
+                    const uint32_t q1 = ( ql0         & 0x0F0F0F0Fu) | ((qh0        & 0x03030303u) << 4);
+                    const uint32_t q2 = ( ql32b       & 0x0F0F0F0Fu) | (((qh0 >> 2) & 0x03030303u) << 4);
+                    const uint32_t q3 = ((ql0   >> 4) & 0x0F0F0F0Fu) | (((qh0 >> 4) & 0x03030303u) << 4);
+                    const uint32_t q4 = ((ql32b >> 4) & 0x0F0F0F0Fu) | (((qh0 >> 6) & 0x03030303u) << 4);
+                    const int is = tt >> 2;
+                    const int yb = n*32;
+                    isum[is    ] = halo_dot4(q1, (int) yq[yb + tt     ], isum[is    ]);
+                    isum[is + 2] = halo_dot4(q2, (int) yq[yb + 8 + tt ], isum[is + 2]);
+                    isum[is + 4] = halo_dot4(q3, (int) yq[yb + 16 + tt], isum[is + 4]);
+                    isum[is + 6] = halo_dot4(q4, (int) yq[yb + 24 + tt], isum[is + 6]);
+                }
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int jj = n*8 + j;
+                    bacc = fmaf((float) sc[jj], yd[jj >> 1]*(float) isum[j] - 32.f*ys[jj], bacc);
+                }
+            }
+            acc += d * bacc;
+        }
+    }
+    dst[lrow] = acc;
+}
+
+void ggml_cuda_halo_qkv_launch(
+        cudaStream_t stream,
+        const void * wq, const void * wk, const void * wv, const float * y,
+        float * dq, float * dk, float * dv,
+        int nrq, int nrk, int nrv,
+        int64_t srbq, int64_t srbk, int64_t srbv,
+        int64_t k, bool v_is_q6) {
+    const int r0 = nrq, r1 = nrq + nrk, r2 = nrq + nrk + nrv;
+    const int blocks = (r2 + HALO_WG - 1) / HALO_WG;
+    if (k == 2048) {
+        if (v_is_q6) {
+            halo_mmv_qkv<8, true ><<<blocks, HALO_WG, 0, stream>>>(wq, wk, wv, y, dq, dk, dv, r0, r1, r2, srbq, srbk, srbv);
+        } else {
+            halo_mmv_qkv<8, false><<<blocks, HALO_WG, 0, stream>>>(wq, wk, wv, y, dq, dk, dv, r0, r1, r2, srbq, srbk, srbv);
+        }
+    } else {
+        GGML_ABORT("halo qkv: unsupported k");
+    }
+}
 // ---- host side ----
 
 bool ggml_cuda_halo_mmvq_supported(
@@ -328,7 +506,9 @@ bool ggml_cuda_halo_mmvq_supported(
             HALO_REJ("q6gate");
         }
         if ((src0->nb[1] % 16) != 0 || (((uintptr_t) src0->data) % 16) != 0) {
-            HALO_REJ("q6align");
+            if (src0->ne[0]*src0->ne[1] > 4*1024*1024) {   // big ops need the aligned path
+                HALO_REJ("q6align");
+            }
         }
     }
     const int64_t k = src0->ne[0];
@@ -356,7 +536,7 @@ bool ggml_cuda_halo_mmvq_supported(
         if (dst->ne[1] != 1 || dst->ne[2] != 1 || src0->ne[2] != 1) {
             HALO_REJ("denseshape");
         }
-        if (src0->ne[1] < 1024) {
+        if (src0->ne[1] < 256) {
             HALO_REJ("denserows");
         }
         if ((k/256) * 256 > 6144) {
