@@ -713,7 +713,8 @@ bool ggml_cuda_halo_mmvq_supported(
         if (dst->ne[1] != 1 || dst->ne[2] != 1 || src0->ne[2] != 1) {
             HALO_REJ("denseshape");
         }
-        if (src0->ne[1] < (src0->type == GGML_TYPE_Q6_K ? 128 : 1024)) {
+        static const int q4_min_rows = getenv("HALO_Q4_MINROWS") ? atoi(getenv("HALO_Q4_MINROWS")) : 512;
+        if (src0->ne[1] < (src0->type == GGML_TYPE_Q6_K ? 128 : q4_min_rows)) {
             HALO_REJ("denserows");
         }
         if ((k/256) * 256 > 6144) {
