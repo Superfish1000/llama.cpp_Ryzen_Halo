@@ -561,6 +561,9 @@ bool ggml_cuda_halo_mmvq_supported(
         if (getenv("HALO_Q6_DISABLE") != nullptr) {
             return false;
         }
+        if (ids && (src0->nb[1] % 16) != 0) {
+            HALO_REJ("q6idsalign");   // stock beats v3 on misaligned expert rows
+        }
         if (fusion && fusion->gate) {
             HALO_REJ("q6gate");
         }
