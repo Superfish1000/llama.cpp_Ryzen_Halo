@@ -181,10 +181,11 @@ static __global__ void halo_mmv_q4k(
 }
 
 
-// ---------------- Q6_K variant ----------------
-// block_q6_K: ql[128] | qh[64] | int8 scales[16] | half d  = 210 bytes (2B aligned).
-// value = d * sc[j] * (q - 32), 16 sub-blocks of 16. No min term.
-// Unsigned dot + analytic -32 correction: sum((q-32)*y) = dot_u(q,y) - 32*sum(y).
+// ---------------- Q6_K variant (v3: Vulkan-style 16-lane cooperative) ----------------
+// 16 lanes share each superblock via 2B typed loads (alignment-immune, coalesced),
+// scales cached in LDS cooperatively, dp4a with ones-vector -32 correction.
+// Lane map (from ggml-vulkan mul_mat_vec_q6_k.comp): itid=tid%16, v_im=itid/8,
+// v_in=itid%8, l0=4*v_in; ql_off=64*v_im+l0, qh_off=32*v_im+l0, s_off=8*v_im+v_in/4.
 template <int NSB>
 static __global__ void halo_mmv_q6k(
         const void * __restrict__ vx, const float * __restrict__ y,
@@ -193,27 +194,20 @@ static __global__ void halo_mmv_q6k(
         const int64_t stride_row_bytes, const int64_t stride_ch_bytes,
         const int64_t stride_ch_dst,
         const int nch_y, const int64_t stride_ch_y, const float * __restrict__ x_bias) {
-    __shared__ int8_t syq[6144];            // nch_y * NSB * 256
-    __shared__ float  syd[192];             // per-32 y scale
-    __shared__ float  ysm16[384];           // per-16 y sums
+    __shared__ int8_t syq[6144];
+    __shared__ float  syd[192];
     const int nsub32 = nch_y*NSB*8;
     for (int s = threadIdx.x; s < nsub32; s += HALO_WG) {
         const int cy = s / (NSB*8);
         const int ls = s % (NSB*8);
         const float * yc = y + (int64_t) cy*stride_ch_y;
-        float amax = 0.f, s0 = 0.f, s1 = 0.f;
+        float amax = 0.f;
 #pragma unroll
-        for (int l = 0; l < 16; ++l) {
-            const float v = yc[ls*32 + l];
-            amax = fmaxf(amax, fabsf(v)); s0 += v;
-        }
-#pragma unroll
-        for (int l = 16; l < 32; ++l) {
-            const float v = yc[ls*32 + l];
-            amax = fmaxf(amax, fabsf(v)); s1 += v;
+        for (int l = 0; l < 32; ++l) {
+            amax = fmaxf(amax, fabsf(yc[ls*32 + l]));
         }
         const float dq = amax / 127.f;
-        syd[s] = dq; ysm16[2*s] = s0; ysm16[2*s + 1] = s1;
+        syd[s] = dq;
         const float inv = dq > 0.f ? 1.f/dq : 0.f;
 #pragma unroll
         for (int l = 0; l < 32; ++l) {
@@ -222,99 +216,85 @@ static __global__ void halo_mmv_q6k(
     }
     __syncthreads();
 
-    const int64_t gr = (int64_t) blockIdx.x*HALO_WG + threadIdx.x;
-    if (gr >= (int64_t) nch_dst * nrows) {
+    // one row per 16-lane group; HALO_WG/16 groups per workgroup
+    const int tid  = threadIdx.x;
+    const int itid = tid & 15;
+    const int grp  = tid >> 4;
+    const int64_t grow = (int64_t) blockIdx.x*(HALO_WG/16) + grp;
+    if (grow >= (int64_t) nch_dst * nrows) {
         return;
     }
-    const int c   = (int)(gr / nrows);
-    const int row = (int)(gr % nrows);
+    const int c   = (int)(grow / nrows);
+    const int row = (int)(grow % nrows);
     const int expert = ids ? ids[c] : c;
     const int cy = c % nch_y;
-
     const uint8_t * base = (const uint8_t *) vx + (int64_t) expert*stride_ch_bytes + (int64_t) row*stride_row_bytes;
+
+    const int v_im = itid >> 3;          // 0/1: which 128-half
+    const int v_in = itid & 7;           // 0..7
+    const int l0   = 4*v_in;             // 0..28
+    const int is   = v_in >> 2;          // 0/1
+    const int ql_off = 64*v_im + l0;     // bytes into ql[128]
+    const int qh_off = 32*v_im + l0;     // bytes into qh[64]
+    const int s_off  = 8*v_im + is;      // scale index base
+    const int yq_off = (32*v_im + v_in); // y word index base within sb (4-quant words)
 
     float acc = 0.f;
     for (int sb = 0; sb < NSB; ++sb) {
-        // rows are 16B-aligned (host guarantees); block sb starts at byte off=210*sb.
-        // Load the covering aligned 224B window, rotate left by (off & 15) bytes.
-        const int      off  = sb*210;
-        uint32_t img[53];
-        if (((uintptr_t) base & 15) != 0 || false) {
-            // unaligned row: safe 2B loads (small latency-bound ops only)
-#pragma unroll
-            for (int i = 0; i < 52; ++i) {
-                const uint16_t lo16 = ((const uint16_t *)(base + off))[2*i];
-                const uint16_t hi16 = ((const uint16_t *)(base + off))[2*i + 1];
-                img[i] = (uint32_t) lo16 | ((uint32_t) hi16 << 16);
-            }
-            img[52] = (uint32_t) ((const uint16_t *)(base + off))[104];
-        } else {
-        const uint4  * rp4  = (const uint4 *) base;
-        uint4 wbuf[14];
-#pragma unroll
-        for (int i = 0; i < 14; ++i) {
-            wbuf[i] = rp4[(off >> 4) + i];
-        }
-        {
-            const uint32_t * in = (const uint32_t *) wbuf;
-            const int skip = (off & 15) >> 2;        // whole words
-            const int shb  = (off & 3) * 8;          // 0 or 16 bits (off is even)
-            if (shb == 0) {
-#pragma unroll
-                for (int i = 0; i < 53; ++i) { img[i] = in[i + skip]; }
-            } else {
-#pragma unroll
-                for (int i = 0; i < 53; ++i) {
-                    img[i] = (in[i + skip] >> shb) | (in[i + skip + 1] << (32 - shb));
-                }
-            }
-        }
-        }
-        const uint32_t * ql32 = img;                             // 32 words
-        const uint32_t * qh32 = img + 32;                        // 16 words
-        const int8_t   * sc   = (const int8_t   *)(img + 48);    // bytes 192..207
-        const float      d    = __half2float(*(const __half *)((const uint8_t *) img + 208));
+        const uint8_t  * blk  = base + (size_t) sb*210;
+        const uint16_t * ql16 = (const uint16_t *)(blk);
+        const uint16_t * qh16 = (const uint16_t *)(blk + 128);
+        const int8_t   * scp  = (const int8_t   *)(blk + 192);
+        const float      d    = __half2float(*(const __half *)(blk + 208));
+
+        const uint32_t ql0  = (uint32_t) ql16[ql_off/2]      | ((uint32_t) ql16[ql_off/2 + 1]  << 16);
+        const uint32_t ql32 = (uint32_t) ql16[ql_off/2 + 16] | ((uint32_t) ql16[ql_off/2 + 17] << 16);
+        const uint32_t qh   = (uint32_t) qh16[qh_off/2]      | ((uint32_t) qh16[qh_off/2 + 1]  << 16);
+
+        const uint32_t q0 = ( ql0        & 0x0F0F0F0Fu) | ((qh & 0x03030303u) << 4);
+        const uint32_t q1 = ( ql32       & 0x0F0F0F0Fu) | ((qh & 0x0C0C0C0Cu) << 2);
+        const uint32_t q2 = ((ql0  >> 4) & 0x0F0F0F0Fu) | ( qh & 0x30303030u);
+        const uint32_t q3 = ((ql32 >> 4) & 0x0F0F0F0Fu) | ((qh & 0xC0C0C0C0u) >> 2);
+
+        // scales: two per lane-region set, read directly (2B loads, cheap via L1)
+        const float sc0 = (float) scp[s_off    ];
+        const float sc1 = (float) scp[s_off + 2];
+        const float sc2 = (float) scp[s_off + 4];
+        const float sc3 = (float) scp[s_off + 6];
 
         const uint32_t * yq = (const uint32_t *) &syq[(cy*NSB + sb)*256];
-        const float    * yd = &syd[(cy*NSB + sb)*8];
-        const float    * ys = &ysm16[(cy*NSB + sb)*16];
+        const int y0 = (int) yq[yq_off     ];
+        const int y1 = (int) yq[yq_off +  8];
+        const int y2 = (int) yq[yq_off + 16];
+        const int y3 = (int) yq[yq_off + 24];
 
-        float bacc = 0.f;
-        // two halves n = 0 (l 0..63 base) and n = 1 (second 128 quants)
-#pragma unroll
-        for (int n = 0; n < 2; ++n) {
-            int isum[8];                     // 8 sub-blocks of 16 per half
-#pragma unroll
-            for (int j = 0; j < 8; ++j) { isum[j] = 0; }
-#pragma unroll
-            for (int t = 0; t < 8; ++t) {    // l = 4t, covers l 0..31
-                const uint32_t ql0  = ql32[n*16 + t];        // ql[l..l+3]
-                const uint32_t ql32b = ql32[n*16 + 8 + t];   // ql[l+32..]
-                const uint32_t qh0  = qh32[n*8 + t];         // qh[l..l+3]
-                const uint32_t q1 = ( ql0        & 0x0F0F0F0Fu) | ((qh0        & 0x03030303u) << 4);
-                const uint32_t q2 = ( ql32b      & 0x0F0F0F0Fu) | (((qh0 >> 2) & 0x03030303u) << 4);
-                const uint32_t q3 = ((ql0  >> 4) & 0x0F0F0F0Fu) | (((qh0 >> 4) & 0x03030303u) << 4);
-                const uint32_t q4 = ((ql32b >> 4) & 0x0F0F0F0Fu) | (((qh0 >> 6) & 0x03030303u) << 4);
-                const int is = t >> 2;                       // 0 or 1 (l/16)
-                const int yb = n*32;                         // y word base of this half
-                isum[is    ] = halo_dot4(q1, (int) yq[yb + t     ], isum[is    ]);
-                isum[is + 2] = halo_dot4(q2, (int) yq[yb + 8 + t ], isum[is + 2]);
-                isum[is + 4] = halo_dot4(q3, (int) yq[yb + 16 + t], isum[is + 4]);
-                isum[is + 6] = halo_dot4(q4, (int) yq[yb + 24 + t], isum[is + 6]);
-            }
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const int jj = n*8 + j;                      // global sub-block 0..15
-                const float dqv = yd[jj >> 1];               // per-32 y scale
-                bacc = fmaf((float) sc[jj], dqv*(float) isum[j] - 32.f*ys[jj], bacc);
-            }
+        const int iq0 = halo_dot4(q0, y0, 0), iy0 = halo_dot4(0x01010101u, y0, 0);
+        const int iq1 = halo_dot4(q1, y1, 0), iy1 = halo_dot4(0x01010101u, y1, 0);
+        const int iq2 = halo_dot4(q2, y2, 0), iy2 = halo_dot4(0x01010101u, y2, 0);
+        const int iq3 = halo_dot4(q3, y3, 0), iy3 = halo_dot4(0x01010101u, y3, 0);
+
+        const float * yd = &syd[(cy*NSB + sb)*8];
+        const float dq0 = yd[4*v_im + 0];
+        const float dq1 = yd[4*v_im + 1];
+        const float dq2 = yd[4*v_im + 2];
+        const float dq3 = yd[4*v_im + 3];
+
+        acc = fmaf(d, sc0*dq0*(float)(iq0 - 32*iy0)
+                    + sc1*dq1*(float)(iq1 - 32*iy1)
+                    + sc2*dq2*(float)(iq2 - 32*iy2)
+                    + sc3*dq3*(float)(iq3 - 32*iy3), acc);
+    }
+    // reduce 16 lanes
+    acc += __shfl_down(acc, 8, 16);
+    acc += __shfl_down(acc, 4, 16);
+    acc += __shfl_down(acc, 2, 16);
+    acc += __shfl_down(acc, 1, 16);
+    if (itid == 0) {
+        if (x_bias != nullptr) {
+            acc += x_bias[row];
         }
-        acc += d * bacc;
+        dst[(int64_t) c*stride_ch_dst + row] = acc;
     }
-    if (x_bias != nullptr) {
-        acc += x_bias[row];
-    }
-    dst[(int64_t) c*stride_ch_dst + row] = acc;
 }
 
 // ---------------- fused QKV kernel (q4,q4,q6 / all-q4) ----------------
@@ -360,7 +340,7 @@ static __global__ void halo_mmv_qkv(
     const int t = row < r0 ? 0 : (row < r1 ? 1 : 2);
     const int lrow = t == 0 ? row : (t == 1 ? row - r0 : row - r1);
     const uint8_t * base = (const uint8_t *)(t == 0 ? w0 : (t == 1 ? w1 : w2))
-                         + (int64_t) lrow * (t == 0 ? srb0 : (t == 1 ? srb1 : srb2));
+                         + (int64_t) lrow * (t == 0 ? srb0 : (t == 1 ? srb1 : srb2));   // byte strides
     float * dst = t == 0 ? d0 : (t == 1 ? d1 : d2);
 
     float acc = 0.f;
@@ -483,6 +463,82 @@ void ggml_cuda_halo_qkv_launch(
         GGML_ABORT("halo qkv: unsupported k");
     }
 }
+
+// Scan for a decode-time QKV triple starting at node i: MUL_MAT(wq 2048x4096 q4_K)
+// followed within a short window by MUL_MAT(wk 2048x512 q4_K) and
+// MUL_MAT(wv 2048x512 q4_K|q6_K), all sharing src1 (the attention input).
+// On match: launch the fused kernel, append the k/v nodes to skip_list, return true.
+bool ggml_cuda_halo_try_qkv(
+        ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
+        std::vector<const ggml_tensor *> & skip_list) {
+    if (getenv("HALO_QKV_ENABLE") == nullptr) {   // fused QKV loses to stream concurrency; opt-in for research
+        return false;
+    }
+    const ggml_tensor * qn = cgraph->nodes[i];
+    if (qn->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const ggml_tensor * wq = qn->src[0];
+    const ggml_tensor * y  = qn->src[1];
+    if (wq->type != GGML_TYPE_Q4_K || y->type != GGML_TYPE_F32 ||
+        qn->type != GGML_TYPE_F32 || qn->ne[1] != 1 || qn->ne[2] != 1) {
+        return false;
+    }
+    if (wq->ne[0] != 2048 || wq->ne[1] < 1024 || !ggml_is_contiguous(y)) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+        return false;
+    }
+    const ggml_tensor * kn = nullptr;
+    const ggml_tensor * vn = nullptr;
+    const int lim = i + 7 < cgraph->n_nodes ? i + 7 : cgraph->n_nodes;
+    for (int j = i + 1; j < lim; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op != GGML_OP_MUL_MAT || n->src[1] != y) {
+            continue;
+        }
+        if (n->ne[1] != 1 || n->ne[2] != 1 || n->type != GGML_TYPE_F32) {
+            return false;
+        }
+        const ggml_tensor * w = n->src[0];
+        if (w->ne[0] != wq->ne[0] || w->ne[1] > wq->ne[1]) {
+            return false;
+        }
+        if (!kn) {
+            if (w->type != GGML_TYPE_Q4_K) {
+                return false;
+            }
+            kn = n;
+        } else {
+            if (w->type == GGML_TYPE_Q4_K) {
+                vn = n;
+            } else if (w->type == GGML_TYPE_Q6_K &&
+                       (w->nb[1] % 16) == 0 && (((uintptr_t) w->data) % 16) == 0) {
+                vn = n;
+            } else {
+                return false;
+            }
+            break;
+        }
+    }
+    if (!kn || !vn) {
+        return false;
+    }
+    const ggml_tensor * wk = kn->src[0];
+    const ggml_tensor * wv = vn->src[0];
+    ggml_cuda_halo_qkv_launch(
+        ctx.stream(),
+        wq->data, wk->data, wv->data, (const float *) y->data,
+        (float *) qn->data, (float *) kn->data, (float *) vn->data,
+        (int) wq->ne[1], (int) wk->ne[1], (int) wv->ne[1],
+        wq->nb[1], wk->nb[1], wv->nb[1],              // byte strides throughout
+        wq->ne[0], wv->type == GGML_TYPE_Q6_K);
+    skip_list.push_back(kn);
+    skip_list.push_back(vn);
+    return true;
+}
 // ---- host side ----
 
 bool ggml_cuda_halo_mmvq_supported(
@@ -502,14 +558,13 @@ bool ggml_cuda_halo_mmvq_supported(
         HALO_REJ("types");
     }
     if (src0->type == GGML_TYPE_Q6_K) {
+        if (getenv("HALO_Q6_DISABLE") != nullptr) {
+            return false;
+        }
         if (fusion && fusion->gate) {
             HALO_REJ("q6gate");
         }
-        if ((src0->nb[1] % 16) != 0 || (((uintptr_t) src0->data) % 16) != 0) {
-            if (src0->ne[0]*src0->ne[1] > 4*1024*1024) {   // big ops need the aligned path
-                HALO_REJ("q6align");
-            }
-        }
+
     }
     const int64_t k = src0->ne[0];
     if (k != 2048 && k != 768 && k != 4096) {
@@ -536,7 +591,7 @@ bool ggml_cuda_halo_mmvq_supported(
         if (dst->ne[1] != 1 || dst->ne[2] != 1 || src0->ne[2] != 1) {
             HALO_REJ("denseshape");
         }
-        if (src0->ne[1] < 256) {
+        if (src0->ne[1] < (src0->type == GGML_TYPE_Q6_K ? 128 : 1024)) {
             HALO_REJ("denserows");
         }
         if ((k/256) * 256 > 6144) {
@@ -591,7 +646,21 @@ void ggml_cuda_halo_mmvq(
     if (src0->type == GGML_TYPE_Q6_K) {
         const int64_t srb = src0->nb[1];
         const int64_t scb = src0->nb[2];
-#define HALO_LAUNCH6(NSBV)         halo_mmv_q6k<NSBV><<<blocks, HALO_WG, 0, stream>>>(             src0->data, (const float *) src1->data, ids_d, (float *) dst->data,             (int) nrows, (int) nch_dst, srb, scb, stride_ch_dst, nch_y, stride_ch_y, x_bias)
+        if (getenv("HALO_DEBUG") != nullptr) {
+            static int dbg_count = 0;
+            if (dbg_count++ < 6) {
+                fprintf(stderr, "halo-q6-accept k=%lld nrows=%lld nch_dst=%lld srb=%lld scb=%lld schd=%lld nch_y=%d schy=%lld xptr=%p yptr=%p ids=%p sne=[%lld,%lld,%lld] snb=[%zu,%zu,%zu] dne=[%lld,%lld,%lld] dnb=[%zu,%zu]\n",
+                    (long long) k, (long long) nrows, (long long) nch_dst, (long long) srb, (long long) scb,
+                    (long long) stride_ch_dst, nch_y, (long long) stride_ch_y,
+                    src0->data, src1->data, ids ? ids->data : nullptr,
+                    (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2],
+                    src1->nb[0], src1->nb[1], src1->nb[2],
+                    (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2],
+                    dst->nb[0], dst->nb[1]);
+            }
+        }
+        const int q6blocks = (int)((total*16 + HALO_WG - 1) / HALO_WG);
+#define HALO_LAUNCH6(NSBV)         halo_mmv_q6k<NSBV><<<q6blocks, HALO_WG, 0, stream>>>(             src0->data, (const float *) src1->data, ids_d, (float *) dst->data,             (int) nrows, (int) nch_dst, srb, scb, stride_ch_dst, nch_y, stride_ch_y, x_bias)
         switch (k) {
             case 2048: HALO_LAUNCH6(8);  break;
             case  768: HALO_LAUNCH6(3);  break;

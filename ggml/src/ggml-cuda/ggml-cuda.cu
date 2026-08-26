@@ -4035,6 +4035,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+bool ggml_cuda_halo_try_qkv(
+        ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
+        std::vector<const ggml_tensor *> & skip_list);
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4133,6 +4137,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            std::vector<const ggml_tensor *> halo_qkv_skip;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4172,6 +4177,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                if (!halo_qkv_skip.empty()) {
+                    bool skip_this = false;
+                    for (size_t hs = 0; hs < halo_qkv_skip.size(); ++hs) {
+                        if (halo_qkv_skip[hs] == node) {
+                            halo_qkv_skip.erase(halo_qkv_skip.begin() + hs);
+                            skip_this = true;
+                            break;
+                        }
+                    }
+                    if (skip_this) {
+                        continue;
+                    }
+                }
+                if (ggml_cuda_halo_try_qkv(*cuda_ctx, cgraph, i, halo_qkv_skip)) {
                     continue;
                 }
 
