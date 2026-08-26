@@ -734,8 +734,15 @@ struct halo_norm_binding {
 // keyed by the (skipped) rms_norm+mul output tensor of the current graph eval
 static std::unordered_map<const ggml_tensor *, halo_norm_binding> halo_norm_map;
 
+struct halo_epi_binding {
+    const float * res;   // residual to add per output row
+    float       * out;   // the (skipped) ADD's dst buffer to write instead
+};
+static std::unordered_map<const ggml_tensor *, halo_epi_binding> halo_epi_map;
+
 void ggml_cuda_halo_norm_clear() {
     halo_norm_map.clear();
+    halo_epi_map.clear();
 }
 
 static void ggml_cuda_halo_norm_fetch(const ggml_tensor * src1, const float ** y_arg, const float ** nw, float * eps) {
@@ -758,7 +765,7 @@ bool ggml_cuda_halo_mmvq_supported(
         return false;
     }
     const bool dbg = getenv("HALO_DEBUG") != nullptr;
-#define HALO_REJ(why) do { if (halo_norm_map.count(src1) != 0) { GGML_ABORT("halo: norm-bound matvec rejected at exec (%s)", why); } if (dbg) fprintf(stderr, "halo-rej %s k=%lld r=%lld ids=%d ne1=%lld sne1=%lld sne2=%lld fus=%d gate=%d\n", why, (long long)src0->ne[0], (long long)src0->ne[1], ids?1:0, (long long)dst->ne[1], (long long)src1->ne[1], (long long)src1->ne[2], fusion?1:0, (fusion&&fusion->gate)?1:0); return false; } while(0)
+#define HALO_REJ(why) do { if (halo_norm_map.count(src1) != 0 || halo_epi_map.count(dst) != 0) { GGML_ABORT("halo: norm-bound matvec rejected at exec (%s)", why); } if (dbg) fprintf(stderr, "halo-rej %s k=%lld r=%lld ids=%d ne1=%lld sne1=%lld sne2=%lld fus=%d gate=%d\n", why, (long long)src0->ne[0], (long long)src0->ne[1], ids?1:0, (long long)dst->ne[1], (long long)src1->ne[1], (long long)src1->ne[2], fusion?1:0, (fusion&&fusion->gate)?1:0); return false; } while(0)
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (!GGML_CUDA_CC_IS_RDNA3_5(cc)) {
@@ -851,6 +858,14 @@ void ggml_cuda_halo_mmvq(
     const void * gate = (fusion && fusion->gate) ? fusion->gate->data : nullptr;
     const int glu_op = (fusion && fusion->gate) ? (int) fusion->glu_op : 0;
     const float * x_bias = (fusion && fusion->x_bias) ? (const float *) fusion->x_bias->data : nullptr;
+    float * dst_data = (float *) dst->data;
+    if (!ids && x_bias == nullptr && !halo_epi_map.empty()) {
+        const auto eit = halo_epi_map.find(dst);
+        if (eit != halo_epi_map.end()) {   // absorbed residual ADD: add res, write the ADD's buffer
+            x_bias   = eit->second.res;
+            dst_data = eit->second.out;
+        }
+    }
 
     const int64_t total  = nch_dst * nrows;
     const int     blocks = (int)((total + HALO_WG - 1) / HALO_WG);
@@ -880,7 +895,7 @@ void ggml_cuda_halo_mmvq(
             }
         }
         const int q6blocks = (int)((total*16 + HALO_WG - 1) / HALO_WG);
-#define HALO_LAUNCH6(NSBV, NORMV)         halo_mmv_q6k<NSBV, NORMV><<<q6blocks, HALO_WG, 0, stream>>>(             src0->data, y_arg, ids_d, (float *) dst->data,             (int) nrows, (int) nch_dst, srb, scb, stride_ch_dst, nch_y, stride_ch_y, x_bias, nw_arg, neps)
+#define HALO_LAUNCH6(NSBV, NORMV)         halo_mmv_q6k<NSBV, NORMV><<<q6blocks, HALO_WG, 0, stream>>>(             src0->data, y_arg, ids_d, dst_data,             (int) nrows, (int) nch_dst, srb, scb, stride_ch_dst, nch_y, stride_ch_y, x_bias, nw_arg, neps)
         switch (k) {
             case 2048: if (nw_arg) { HALO_LAUNCH6(8,  true); } else { HALO_LAUNCH6(8,  false); } break;
             case  768: if (nw_arg) { HALO_LAUNCH6(3,  true); } else { HALO_LAUNCH6(3,  false); } break;
@@ -890,7 +905,7 @@ void ggml_cuda_halo_mmvq(
 #undef HALO_LAUNCH6
         return;
     }
-#define HALO_LAUNCH(NSBV, GATEV, NORMV, GATEPTR, GLUV)     halo_mmv_q4k<NSBV, GATEV, NORMV><<<blocks, HALO_WG, 0, stream>>>(         src0->data, GATEPTR, y_arg, ids_d,         (float *) dst->data, (int) nrows, (int) nch_dst, stride_row_blk, stride_ch_blk,         stride_ch_dst, GLUV, nch_y, stride_ch_y, x_bias, nw_arg, neps)
+#define HALO_LAUNCH(NSBV, GATEV, NORMV, GATEPTR, GLUV)     halo_mmv_q4k<NSBV, GATEV, NORMV><<<blocks, HALO_WG, 0, stream>>>(         src0->data, GATEPTR, y_arg, ids_d,         dst_data, (int) nrows, (int) nch_dst, stride_row_blk, stride_ch_blk,         stride_ch_dst, GLUV, nch_y, stride_ch_y, x_bias, nw_arg, neps)
     switch (k) {
         case 2048: if (gate) { HALO_LAUNCH(8,  true, false, gate, glu_op); } else if (nw_arg) { HALO_LAUNCH(8,  false, true, nullptr, 0); } else { HALO_LAUNCH(8,  false, false, nullptr, 0); } break;
         case  768: if (gate) { HALO_LAUNCH(3,  true, false, gate, glu_op); } else if (nw_arg) { HALO_LAUNCH(3,  false, true, nullptr, 0); } else { HALO_LAUNCH(3,  false, false, nullptr, 0); } break;
@@ -1025,4 +1040,79 @@ bool ggml_cuda_halo_try_norm(const ggml_cgraph * cgraph, int i, std::vector<cons
     halo_norm_map[ml] = { (const float *) x->data, (const float *) w->data, eps };
     skip_list.push_back(ml);   // rn (the current node) is skipped by the caller
     return true;
+}
+
+// Absorb a decode-time residual ADD into the halo matvec x_bias epilogue:
+// MUL_MAT (halo-accepted dense) whose dst's SOLE consumer is a same-shape
+// f32 ADD. The matvec then writes the ADD's buffer directly with the
+// residual added per row (deterministic: each thread owns its row).
+// Opt-in via HALO_EPI=1. Mutually exclusive with HALO_QKV_ENABLE.
+bool ggml_cuda_halo_try_epi(const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list) {
+    static const bool en = getenv("HALO_EPI") != nullptr && getenv("HALO_QKV_ENABLE") == nullptr;
+    if (!en) {
+        return false;
+    }
+    const ggml_tensor * mm = cgraph->nodes[i];
+    if (mm->op != GGML_OP_MUL_MAT || i + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    if (mm->ne[1] != 1 || mm->ne[2] != 1) {
+        return false;
+    }
+    // find the sole ADD consumer within a short window
+    ggml_tensor * ad = nullptr;
+    const int wlim = i + 5 < cgraph->n_nodes ? i + 5 : cgraph->n_nodes;
+    for (int j = i + 1; j < wlim; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_ADD && (n->src[0] == mm || n->src[1] == mm)) {
+            ad = n;
+            break;
+        }
+    }
+    if (ad == nullptr) {
+        return false;
+    }
+    const ggml_tensor * res = ad->src[0] == mm ? ad->src[1] : ad->src[0];
+    if (ad->type != GGML_TYPE_F32 || res->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(ad, mm) || !ggml_are_same_shape(res, mm)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(res) || !ggml_is_contiguous(ad) || !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    if (!ggml_cuda_halo_mmvq_supported(mm->src[0], mm->src[1], nullptr, mm, nullptr)) {
+        return false;
+    }
+    // mm's dst must have NO other consumer than ad, directly or via views
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n == ad) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            if (src == mm) {
+                return false;
+            }
+            for (const ggml_tensor * vs = src->view_src; vs != nullptr; vs = vs->view_src) {
+                if (vs == mm) {
+                    return false;
+                }
+            }
+        }
+    }
+    if (getenv("HALO_DEBUG") != nullptr) {
+        static int nreg = 0;
+        if (nreg++ < 4) {
+            fprintf(stderr, "halo-epi-absorb: mm=%s r=%lld add=%s\n", mm->name, (long long) mm->src[0]->ne[1], ad->name);
+        }
+    }
+    halo_epi_map[mm] = { (const float *) res->data, (float *) ad->data };
+    skip_list.push_back(ad);
+    return false;   // the MUL_MAT node itself still executes (via the halo hook)
 }
