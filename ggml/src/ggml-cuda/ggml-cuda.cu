@@ -4039,6 +4039,9 @@ bool ggml_cuda_halo_try_qkv(
         ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
         std::vector<const ggml_tensor *> & skip_list);
 
+bool ggml_cuda_halo_try_norm(const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list);
+void ggml_cuda_halo_norm_clear();
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4138,6 +4141,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             std::vector<const ggml_tensor *> halo_qkv_skip;
+            ggml_cuda_halo_norm_clear();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4194,6 +4198,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
                 if (ggml_cuda_halo_try_qkv(*cuda_ctx, cgraph, i, halo_qkv_skip)) {
+                    continue;
+                }
+                if (ggml_cuda_halo_try_norm(cgraph, i, halo_qkv_skip)) {
                     continue;
                 }
 
