@@ -4398,8 +4398,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 #endif
 
     static bool enable_graph_optimization = [] {
+        // default ON for this fork: stream fork/join concurrency measured +4.9 t/s
+        // on gfx1151 (qwen3moe tg128 77.8 -> 82.8, token-identical, PPL exact).
+        // Set GGML_CUDA_GRAPH_OPT=0 to disable.
         const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
-        return env != nullptr && atoi(env) == 1;
+        return env == nullptr || atoi(env) != 0;
     }();
 
     if (!enable_graph_optimization) {

@@ -213,7 +213,7 @@ set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
 
 option(GGML_HIP                             "ggml: use HIP"                                   OFF)
-option(GGML_HIP_GRAPHS                      "ggml: use HIP graph"                              OFF) # gfx1151/ROCm 10.1: replay measured 0.5 t/s SLOWER than direct launch (qwen tg128 77.9 vs 78.4)
+option(GGML_HIP_GRAPHS                      "ggml: use HIP graph"                              ON) # gfx1151: replay alone loses 0.5 t/s, but graphs enable stream-concurrency (GGML_CUDA_GRAPH_OPT) which nets +4.4 (78.4 -> 82.8)
 option(GGML_HIP_RCCL                        "ggml: use ROCm Collective Comm. Library"         OFF)
 option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"                 ON)
 option(GGML_HIP_MMQ_MFMA                    "ggml: enable MFMA MMA for CDNA in MMQ"           ON)
