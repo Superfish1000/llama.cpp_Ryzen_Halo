@@ -539,6 +539,125 @@ bool ggml_cuda_halo_try_qkv(
     skip_list.push_back(vn);
     return true;
 }
+
+// ---------------- F16 kernels: row-walk (mid-m) + 16-lane (giant/small m) ----------------
+template <int WGS>
+static __global__ void halo_mmv_f16_deep(
+        const __half * __restrict__ A, const float * __restrict__ y,
+        float * __restrict__ dst, const int nrows, const int k,
+        const int64_t stride_row_halves, const float * __restrict__ x_bias) {
+    extern __shared__ float hsy[];
+    for (int i = threadIdx.x; i < k; i += WGS) hsy[i] = y[i];
+    __syncthreads();
+    const int row = blockIdx.x*WGS + threadIdx.x;
+    if (row >= nrows) return;
+    const uint4 * base = (const uint4 *)(A + (size_t) row*stride_row_halves);
+    float acc = 0.f;
+    const int nv = k/8;
+    for (int v = 0; v < nv; v += 8) {
+        uint4 w[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) w[i] = base[v + i];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const __half2 * h2 = (const __half2 *) &w[i];
+            const float * yb = &hsy[(v + i)*8];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 hf = __half22float2(h2[j]);
+                acc = fmaf(hf.x, yb[2*j],   acc);
+                acc = fmaf(hf.y, yb[2*j+1], acc);
+            }
+        }
+    }
+    if (x_bias != nullptr) acc += x_bias[row];
+    dst[row] = acc;
+}
+
+template <int WGS>
+static __global__ void halo_mmv_f16_l16(
+        const __half * __restrict__ A, const float * __restrict__ y,
+        float * __restrict__ dst, const int nrows, const int k,
+        const int64_t stride_row_halves, const float * __restrict__ x_bias) {
+    extern __shared__ float hsy[];
+    for (int i = threadIdx.x; i < k; i += WGS) hsy[i] = y[i];
+    __syncthreads();
+    const int itid = threadIdx.x & 15;
+    const int grp  = threadIdx.x >> 4;
+    const int64_t grow = (int64_t) blockIdx.x*(WGS/16) + grp;
+    if (grow >= nrows) return;
+    const int row = (int) grow;
+    const uint4 * base = (const uint4 *)(A + (size_t) row*stride_row_halves);
+    float acc = 0.f;
+    const int nv = k/8;
+    for (int v = itid; v < nv; v += 16) {
+        const uint4 w = base[v];
+        const __half2 * h2 = (const __half2 *) &w;
+        const float * yb = &hsy[v*8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 hf = __half22float2(h2[j]);
+            acc = fmaf(hf.x, yb[2*j],   acc);
+            acc = fmaf(hf.y, yb[2*j+1], acc);
+        }
+    }
+    acc += __shfl_down(acc, 8, 16);
+    acc += __shfl_down(acc, 4, 16);
+    acc += __shfl_down(acc, 2, 16);
+    acc += __shfl_down(acc, 1, 16);
+    if (itid == 0) {
+        float r = acc;
+        if (x_bias != nullptr) r += x_bias[row];
+        dst[row] = r;
+    }
+}
+
+// host: support + launch for dense decode f16 matvec
+bool ggml_cuda_halo_f16_supported(
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    if (getenv("HALO_F16_DISABLE") != nullptr) return false;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_RDNA3_5(cc)) return false;
+    if (src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (ids) return false;
+    if (dst->ne[1] != 1 || dst->ne[2] != 1 || src0->ne[2] != 1) return false;
+    const int64_t k = src0->ne[0];
+    if (k % 8 != 0 || k > 16384) return false;          // LDS: k*4 bytes
+    if (src0->ne[1] < 32768) return false;              // head-class only: stock mmvf wins below (256-lane co-op, ~198 GB/s in-graph)
+    if ((src0->nb[1] % 16) != 0 || (((uintptr_t) src0->data) % 16) != 0) return false;
+    if (!ggml_is_contiguous(src1) || src1->ne[1] != 1) return false;
+    if (fusion) {
+        if (fusion->gate || fusion->gate_bias || fusion->x_scale || fusion->gate_scale) return false;
+        if (fusion->x_bias) {
+            if (fusion->x_bias->type != GGML_TYPE_F32 || fusion->x_bias->ne[0] != dst->ne[0]) return false;
+        }
+    }
+    return true;
+}
+
+void ggml_cuda_halo_f16(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    const int nrows = (int) src0->ne[1];
+    const int k     = (int) src0->ne[0];
+    const int64_t srh = src0->nb[1] / sizeof(__half);
+    const float * x_bias = (fusion && fusion->x_bias) ? (const float *) fusion->x_bias->data : nullptr;
+    cudaStream_t stream = ctx.stream();
+    const size_t lds = (size_t) k * sizeof(float);
+    if (true) {   // 16-lane everywhere: row-walk collapses under in-graph TLB pressure
+        const int blocks = (int)(((int64_t) nrows*16 + HALO_WG - 1) / HALO_WG);
+        halo_mmv_f16_l16<HALO_WG><<<blocks, HALO_WG, lds, stream>>>(
+            (const __half *) src0->data, (const float *) src1->data, (float *) dst->data,
+            nrows, k, srh, x_bias);
+    } else {
+        const int blocks = (nrows + HALO_WG - 1) / HALO_WG;
+        halo_mmv_f16_deep<HALO_WG><<<blocks, HALO_WG, lds, stream>>>(
+            (const __half *) src0->data, (const float *) src1->data, (float *) dst->data,
+            nrows, k, srh, x_bias);
+    }
+}
+
 // ---- host side ----
 
 bool ggml_cuda_halo_mmvq_supported(

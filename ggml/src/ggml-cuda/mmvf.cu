@@ -629,6 +629,15 @@ static void mul_mat_vec_f_cuda(
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+
+    { // gfx1151 halo f16 path
+        extern bool ggml_cuda_halo_f16_supported(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_cuda_mm_fusion_args_host *);
+        extern void ggml_cuda_halo_f16(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, const ggml_cuda_mm_fusion_args_host *);
+        if (ggml_cuda_halo_f16_supported(src0, src1, ids, dst, fusion)) {
+            ggml_cuda_halo_f16(ctx, src0, src1, dst, fusion);
+            return;
+        }
+    }
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);
 
