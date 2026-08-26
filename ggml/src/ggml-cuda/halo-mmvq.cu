@@ -793,8 +793,9 @@ bool ggml_cuda_halo_mmvq_supported(
         if (getenv("HALO_Q6_DISABLE") != nullptr) {
             return false;
         }
-        if (ids && (src0->nb[1] % 16) != 0) {
-            HALO_REJ("q6idsalign");   // stock beats v3 on misaligned expert rows
+        static const bool q6_ids_force = getenv("HALO_Q6_IDS_FORCE") != nullptr;
+        if (ids && (src0->nb[1] % 16) != 0 && !q6_ids_force) {
+            HALO_REJ("q6idsalign");   // stock beats v3 on misaligned expert rows (solo; HALO_Q6_IDS_FORCE re-tests under concurrency)
         }
         if (fusion && fusion->gate) {
             HALO_REJ("q6gate");

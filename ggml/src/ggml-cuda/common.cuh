@@ -1488,6 +1488,35 @@ struct ggml_backend_cuda_context {
     cudaStream_t stream(int device, int stream) {
         if (streams[device][stream] == nullptr) {
             ggml_cuda_set_device(device);
+#if defined(GGML_USE_HIP)
+            // HALO_CU_MASKS="n1,n2,..." pins concurrent fork streams 1..N to
+            // disjoint CU ranges (carved from CU 0 upward) to reduce DRAM
+            // contention between overlapping kernels. Stream 0 keeps all CUs.
+            static const char * cu_masks_env = getenv("HALO_CU_MASKS");
+            if (cu_masks_env != nullptr && stream >= 1) {
+                int counts[GGML_CUDA_MAX_STREAMS] = {0};
+                int nparsed = 0;
+                for (const char * p = cu_masks_env; p != nullptr && nparsed < GGML_CUDA_MAX_STREAMS; ) {
+                    counts[nparsed++] = atoi(p);
+                    p = strchr(p, ',');
+                    if (p != nullptr) {
+                        p += 1;
+                    }
+                }
+                if (stream <= nparsed && counts[stream - 1] > 0) {
+                    int start = 0;
+                    for (int i = 0; i < stream - 1; ++i) {
+                        start += counts[i];
+                    }
+                    uint32_t mask[4] = {0, 0, 0, 0};
+                    for (int cu = start; cu < start + counts[stream - 1] && cu < 128; ++cu) {
+                        mask[cu >> 5] |= 1u << (cu & 31);
+                    }
+                    CUDA_CHECK(hipExtStreamCreateWithCUMask(&streams[device][stream], 4, mask));
+                    return streams[device][stream];
+                }
+            }
+#endif // defined(GGML_USE_HIP)
             CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
         }
         return streams[device][stream];
