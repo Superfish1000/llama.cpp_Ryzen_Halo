@@ -1250,6 +1250,15 @@ void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+
+    { // gfx1151 halo path: f32-direct q4_K MoE matvec (skips q8_1 quantize launch)
+        extern bool ggml_cuda_halo_mmvq_supported(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_cuda_mm_fusion_args_host *);
+        extern void ggml_cuda_halo_mmvq(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, const ggml_cuda_mm_fusion_args_host *);
+        if (ggml_cuda_halo_mmvq_supported(src0, src1, ids, dst, fusion)) {
+            ggml_cuda_halo_mmvq(ctx, src0, src1, ids, dst, fusion);
+            return;
+        }
+    }
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
 
