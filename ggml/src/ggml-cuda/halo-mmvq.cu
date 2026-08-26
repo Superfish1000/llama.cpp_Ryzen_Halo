@@ -734,6 +734,40 @@ void ggml_cuda_halo_f16(
 
 // ---- host side ----
 
+
+static __global__ void halo_add_rms_mul(
+        const float * __restrict__ a, const float * __restrict__ b,
+        const float * __restrict__ w,
+        float * __restrict__ sum_out, float * __restrict__ norm_out,
+        const int ncols, const float eps) {
+    extern __shared__ float s_buf[];   // ncols floats + 8 reduce slots
+    float * s_red2 = s_buf + ncols;
+    float ssq = 0.f;
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+        const float v = a[i] + b[i];
+        s_buf[i] = v;
+        sum_out[i] = v;
+        ssq = fmaf(v, v, ssq);
+    }
+    ssq += __shfl_down(ssq, 16, 32);
+    ssq += __shfl_down(ssq,  8, 32);
+    ssq += __shfl_down(ssq,  4, 32);
+    ssq += __shfl_down(ssq,  2, 32);
+    ssq += __shfl_down(ssq,  1, 32);
+    if ((threadIdx.x & 31) == 0) {
+        s_red2[threadIdx.x >> 5] = ssq;
+    }
+    __syncthreads();
+    float t = 0.f;
+    for (unsigned int i = 0; i < blockDim.x/32; ++i) {
+        t += s_red2[i];
+    }
+    const float rrms = rsqrtf(t/(float) ncols + eps);
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+        norm_out[i] = s_buf[i]*rrms*w[i];
+    }
+}
+
 struct halo_norm_binding {
     const float * x;
     const float * w;
@@ -1213,4 +1247,92 @@ bool ggml_cuda_halo_try_moe(const ggml_cgraph * cgraph, int i, std::vector<const
     halo_moe_map[mm] = { (const float *) w->data, (float *) ml->data };
     skip_list.push_back(ml);
     return false;   // mm itself still executes via the halo hook
+}
+
+// Fuse decode-time [residual ADD] + [RMS_NORM + MUL] into one kernel that
+// writes both the sum and the normed output. Opt-in via HALO_ADDNORM=1.
+bool ggml_cuda_halo_try_addnorm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
+                                std::vector<const ggml_tensor *> & skip_list) {
+    static const bool en = getenv("HALO_ADDNORM") != nullptr;
+    if (!en) {
+        return false;
+    }
+    const ggml_tensor * ad = cgraph->nodes[i];
+    if (ad->op != GGML_OP_ADD || i + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    if (ad->type != GGML_TYPE_F32 || ad->ne[1] != 1 || ad->ne[2] != 1 || ad->ne[3] != 1) {
+        return false;
+    }
+    const ggml_tensor * a = ad->src[0];
+    const ggml_tensor * b = ad->src[1];
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(a, ad) || !ggml_are_same_shape(b, ad) ||
+        !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(ad)) {
+        return false;
+    }
+    // find RMS_NORM(ad) then MUL(rms, w) in a short window
+    const ggml_tensor * rn = nullptr;
+    ggml_tensor * ml = nullptr;
+    const int wlim = i + 5 < cgraph->n_nodes ? i + 5 : cgraph->n_nodes;
+    for (int j = i + 1; j < wlim; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (rn == nullptr && n->op == GGML_OP_RMS_NORM && n->src[0] == ad) {
+            rn = n;
+            continue;
+        }
+        if (rn != nullptr && n->op == GGML_OP_MUL && n->src[0] == rn) {
+            ml = n;
+            break;
+        }
+    }
+    if (rn == nullptr || ml == nullptr) {
+        return false;
+    }
+    const ggml_tensor * w = ml->src[1];
+    if (rn->type != GGML_TYPE_F32 || ml->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (w->ne[0] != ad->ne[0] || ggml_nelements(w) != ad->ne[0] ||
+        !ggml_is_contiguous(w) || !ggml_is_contiguous(ml) || !ggml_is_contiguous(rn)) {
+        return false;
+    }
+    // rn must have no consumer other than ml (the sum ad may have many - we write it)
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n == ml) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            if (src == rn) {
+                return false;
+            }
+            for (const ggml_tensor * vs = src->view_src; vs != nullptr; vs = vs->view_src) {
+                if (vs == rn || vs == ml) {
+                    return false;
+                }
+            }
+        }
+    }
+    float eps;
+    memcpy(&eps, rn->op_params, sizeof(float));
+    const int ncols = (int) ad->ne[0];
+    const int nthreads = 256;
+    const size_t lds = (size_t) ncols*sizeof(float) + 8*sizeof(float);
+    halo_add_rms_mul<<<1, nthreads, lds, ctx.stream()>>>(
+        (const float *) a->data, (const float *) b->data, (const float *) w->data,
+        (float *) ad->data, (float *) ml->data, ncols, eps);
+    if (getenv("HALO_DEBUG") != nullptr) {
+        static int nreg = 0;
+        if (nreg++ < 4) {
+            fprintf(stderr, "halo-addnorm: add=%s norm=%s\n", ad->name, ml->name);
+        }
+    }
+    skip_list.push_back(rn);
+    skip_list.push_back(ml);
+    return true;   // the ADD node itself is replaced by this launch
 }
