@@ -31,7 +31,7 @@ static __device__ __forceinline__ int halo_dot4(uint32_t w_nib, int y4, int acc)
 }
 
 // One thread owns one (expert-slot, row); walks NSB superblocks of up (+gate).
-template <int NSB, bool HAS_GATE, bool HAS_NORM>
+template <int NSB, bool HAS_GATE, bool HAS_NORM, bool SB>
 static __global__ void halo_mmv_q4k(
         const void * __restrict__ vx, const void * __restrict__ vgate,
         const float * __restrict__ y, const int32_t * __restrict__ ids,
@@ -114,16 +114,25 @@ static __global__ void halo_mmv_q4k(
     }
 
     uint4 wA[9], wB[9], gA[9], gB[9];
+    if (!SB) {
 #pragma unroll
-    for (int i = 0; i < 9; ++i) { wA[i] = bx[i]; }
-    if (HAS_GATE) {
+        for (int i = 0; i < 9; ++i) { wA[i] = bx[i]; }
+        if (HAS_GATE) {
 #pragma unroll
-        for (int i = 0; i < 9; ++i) { gA[i] = bg[i]; }
+            for (int i = 0; i < 9; ++i) { gA[i] = bg[i]; }
+        }
     }
 
     float acc_x = 0.f, acc_g = 0.f;
     for (int sb = 0; sb < NSB; ++sb) {
-        if (sb + 1 < NSB) {
+        if (SB) {
+#pragma unroll
+            for (int i = 0; i < 9; ++i) { wA[i] = bx[sb*9 + i]; }
+            if (HAS_GATE) {
+#pragma unroll
+                for (int i = 0; i < 9; ++i) { gA[i] = bg[sb*9 + i]; }
+            }
+        } else if (sb + 1 < NSB) {
 #pragma unroll
             for (int i = 0; i < 9; ++i) { wB[i] = bx[(sb+1)*9 + i]; }
             if (HAS_GATE) {
@@ -186,8 +195,10 @@ static __global__ void halo_mmv_q4k(
             }
             acc_g += d*sMul - dmin*sMin;
         }
+        if (!SB) {
 #pragma unroll
-        for (int i = 0; i < 9; ++i) { wA[i] = wB[i]; }
+            for (int i = 0; i < 9; ++i) { wA[i] = wB[i]; }
+        }
         if (HAS_GATE) {
 #pragma unroll
             for (int i = 0; i < 9; ++i) { gA[i] = gB[i]; }
@@ -963,11 +974,23 @@ void ggml_cuda_halo_mmvq(
 #undef HALO_LAUNCH6
         return;
     }
-#define HALO_LAUNCH(NSBV, GATEV, NORMV, GATEPTR, GLUV)     halo_mmv_q4k<NSBV, GATEV, NORMV><<<blocks, HALO_WG, 0, stream>>>(         src0->data, GATEPTR, y_arg, ids_d,         dst_data, (int) nrows, (int) nch_dst, stride_row_blk, stride_ch_blk,         stride_ch_dst, GLUV, nch_y, stride_ch_y, x_bias, nw_arg, neps, ch_scale)
+#define HALO_LAUNCH(NSBV, GATEV, NORMV, SBV, GATEPTR, GLUV)     halo_mmv_q4k<NSBV, GATEV, NORMV, SBV><<<blocks, HALO_WG, 0, stream>>>(         src0->data, GATEPTR, y_arg, ids_d,         dst_data, (int) nrows, (int) nch_dst, stride_row_blk, stride_ch_blk,         stride_ch_dst, GLUV, nch_y, stride_ch_y, x_bias, nw_arg, neps, ch_scale)
+    static const int halo_sb = getenv("HALO_SB") ? atoi(getenv("HALO_SB")) : 1;   // 0 off, 1 short-k only, 2 all
+    const bool sb_all = halo_sb >= 2;
+    const bool sb_768 = halo_sb >= 1;
     switch (k) {
-        case 2048: if (gate) { HALO_LAUNCH(8,  true, false, gate, glu_op); } else if (nw_arg) { HALO_LAUNCH(8,  false, true, nullptr, 0); } else { HALO_LAUNCH(8,  false, false, nullptr, 0); } break;
-        case  768: if (gate) { HALO_LAUNCH(3,  true, false, gate, glu_op); } else if (nw_arg) { HALO_LAUNCH(3,  false, true, nullptr, 0); } else { HALO_LAUNCH(3,  false, false, nullptr, 0); } break;
-        case 4096: if (gate) { HALO_LAUNCH(16, true, false, gate, glu_op); } else if (nw_arg) { HALO_LAUNCH(16, false, true, nullptr, 0); } else { HALO_LAUNCH(16, false, false, nullptr, 0); } break;
+        case 2048: if (gate) { if (sb_all) { HALO_LAUNCH(8,  true, false, true, gate, glu_op); } else { HALO_LAUNCH(8,  true, false, false, gate, glu_op); } }
+                   else if (nw_arg) { HALO_LAUNCH(8,  false, true, false, nullptr, 0); }
+                   else if (sb_all) { HALO_LAUNCH(8,  false, false, true, nullptr, 0); }
+                   else { HALO_LAUNCH(8,  false, false, false, nullptr, 0); } break;
+        case  768: if (gate) { HALO_LAUNCH(3,  true, false, false, gate, glu_op); }
+                   else if (nw_arg) { HALO_LAUNCH(3,  false, true, false, nullptr, 0); }
+                   else if (sb_768) { HALO_LAUNCH(3,  false, false, true, nullptr, 0); }
+                   else { HALO_LAUNCH(3,  false, false, false, nullptr, 0); } break;
+        case 4096: if (gate) { HALO_LAUNCH(16, true, false, false, gate, glu_op); }
+                   else if (nw_arg) { HALO_LAUNCH(16, false, true, false, nullptr, 0); }
+                   else if (sb_all) { HALO_LAUNCH(16, false, false, true, nullptr, 0); }
+                   else { HALO_LAUNCH(16, false, false, false, nullptr, 0); } break;
         default: GGML_ABORT("halo: unsupported k");
     }
 #undef HALO_LAUNCH
