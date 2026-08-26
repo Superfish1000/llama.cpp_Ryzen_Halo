@@ -4042,6 +4042,7 @@ bool ggml_cuda_halo_try_qkv(
 bool ggml_cuda_halo_try_norm(const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list);
 void ggml_cuda_halo_norm_clear();
 bool ggml_cuda_halo_try_epi(const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list);
+bool ggml_cuda_halo_try_moe(const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list);
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
@@ -4205,6 +4206,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
                 (void) ggml_cuda_halo_try_epi(cgraph, i, halo_qkv_skip);
+                (void) ggml_cuda_halo_try_moe(cgraph, i, halo_qkv_skip);
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
