@@ -6,6 +6,8 @@
 // Hooked from ggml_cuda_mul_mat_vec_q for: Q4_K, ids path (MUL_MAT_ID),
 // ncols_dst==1, k in {768, 2048}; optional gate fusion (SWIGLU/GEGLU/MUL).
 #include "common.cuh"
+#include <unordered_map>
+#include <unordered_set>
 #include "unary.cuh"
 
 #define HALO_WG 128
@@ -29,8 +31,33 @@ static __device__ __forceinline__ int halo_dot4(uint32_t w_nib, int y4, int acc)
 #endif
 }
 
+typedef unsigned int halo_uv4 __attribute__((ext_vector_type(4)));
+typedef int halo_iv4 __attribute__((ext_vector_type(4)));
+using halo_rsrc_t = decltype(__builtin_amdgcn_make_buffer_rsrc((void *) nullptr, (short) 0, 0u, 0u));
+#define HALO_RSRC_FLAGS 0x30004000u
+// Weight superblocks are single-use per token. MODE 0: plain loads. MODE 1:
+// __builtin_nontemporal (glc slc) — measured -20%: the glc bit bypasses L0 and
+// kills the within-thread line locality of the 144B block walk. MODE 2/3/4:
+// buffer loads with aux slc / dlc / slc|dlc — stream the outer caches (keep
+// L2/MALL for activations and KV under overlap) while L0 locality survives.
+template <int MODE>
+static __device__ __forceinline__ uint4 halo_ldw(const uint4 * p, halo_rsrc_t r, unsigned off) {
+    uint4 q;
+    if constexpr (MODE == 0) {
+        q = *p;
+    } else if constexpr (MODE == 1) {
+        halo_uv4 t = __builtin_nontemporal_load((const halo_uv4 *) p);
+        q.x = t[0]; q.y = t[1]; q.z = t[2]; q.w = t[3];
+    } else {
+        constexpr int aux = MODE == 2 ? 2 : MODE == 3 ? 4 : 6;
+        halo_iv4 v = __builtin_amdgcn_raw_buffer_load_b128(r, off, 0, aux);
+        q.x = (unsigned) v[0]; q.y = (unsigned) v[1]; q.z = (unsigned) v[2]; q.w = (unsigned) v[3];
+    }
+    return q;
+}
+
 // One thread owns one (expert-slot, row); walks NSB superblocks of up (+gate).
-template <int NSB, bool HAS_GATE>
+template <int NSB, bool HAS_GATE, bool HAS_NORM, bool SB, int NTM, int TR>
 static __global__ void halo_mmv_q4k(
         const void * __restrict__ vx, const void * __restrict__ vgate,
         const float * __restrict__ y, const int32_t * __restrict__ ids,
@@ -38,10 +65,40 @@ static __global__ void halo_mmv_q4k(
         const int nrows, const int nch_dst,
         const int64_t stride_row_blk, const int64_t stride_ch_blk,
         const int64_t stride_ch_dst, const int glu_op,
-        const int nch_y, const int64_t stride_ch_y, const float * __restrict__ x_bias) {
+        const int nch_y, const int64_t stride_ch_y, const float * __restrict__ x_bias,
+        const float * __restrict__ nw, const float norm_eps,
+        const float * __restrict__ ch_scale) {
     __shared__ int8_t syq[6144];           // up to nch_y*NSB*256 (max 8*3*256)
     __shared__ float  syd[192];
     __shared__ float  ysm[192];
+    float rrms = 1.0f;
+    if (HAS_NORM) {   // absorbed rms_norm+mul: y is the raw residual x
+        __shared__ float s_red[HALO_WG/32];
+        __shared__ float s_rrms;
+        float ssq = 0.f;
+        for (int i2 = threadIdx.x; i2 < NSB*256; i2 += HALO_WG) {
+            const float v2 = y[i2];
+            ssq = fmaf(v2, v2, ssq);
+        }
+        ssq += __shfl_down(ssq, 16, 32);
+        ssq += __shfl_down(ssq,  8, 32);
+        ssq += __shfl_down(ssq,  4, 32);
+        ssq += __shfl_down(ssq,  2, 32);
+        ssq += __shfl_down(ssq,  1, 32);
+        if ((threadIdx.x & 31) == 0) {
+            s_red[threadIdx.x >> 5] = ssq;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t2 = 0.f;
+            for (int w2 = 0; w2 < HALO_WG/32; ++w2) {
+                t2 += s_red[w2];
+            }
+            s_rrms = rsqrtf(t2/(float)(NSB*256) + norm_eps);
+        }
+        __syncthreads();
+        rrms = s_rrms;
+    }
     const int nsub = nch_y*NSB*8;
     for (int s = threadIdx.x; s < nsub; s += HALO_WG) {
         const int cy = s / (NSB*8);
@@ -50,7 +107,8 @@ static __global__ void halo_mmv_q4k(
         float amax = 0.f, sum = 0.f;
 #pragma unroll
         for (int l = 0; l < 32; ++l) {
-            const float v = yc[ls*32 + l];
+            float v = yc[ls*32 + l];
+            if (HAS_NORM) { v = v*rrms*nw[ls*32 + l]; }
             amax = fmaxf(amax, fabsf(v)); sum += v;
         }
         const float dq = amax / 127.f;
@@ -58,7 +116,9 @@ static __global__ void halo_mmv_q4k(
         const float inv = dq > 0.f ? 1.f/dq : 0.f;
 #pragma unroll
         for (int l = 0; l < 32; ++l) {
-            syq[s*32 + l] = (int8_t) lrintf(yc[ls*32 + l] * inv);
+            float vq = yc[ls*32 + l];
+            if (HAS_NORM) { vq = vq*rrms*nw[ls*32 + l]; }
+            syq[s*32 + l] = (int8_t) lrintf(vq * inv);
         }
     }
     __syncthreads();
@@ -78,23 +138,45 @@ static __global__ void halo_mmv_q4k(
     if (HAS_GATE) {
         bg = (const uint4 *)((const block_q4_K *) vgate + (int64_t) expert*stride_ch_blk + (int64_t) row*stride_row_blk);
     }
+    // Uniform descriptors (base = tensor start, SGPR) with per-thread 32-bit
+    // byte offsets: every weight tensor here is < 4GB. Dead code for NTM < 2.
+    const halo_rsrc_t xr  = __builtin_amdgcn_make_buffer_rsrc((void *) vx, (short) 0, 0xffffffffu, HALO_RSRC_FLAGS);
+    const halo_rsrc_t gr2 = __builtin_amdgcn_make_buffer_rsrc((void *)(HAS_GATE ? vgate : vx), (short) 0, 0xffffffffu, HALO_RSRC_FLAGS);
+    const unsigned xoff = (unsigned)(((int64_t) expert*stride_ch_blk + (int64_t) row*stride_row_blk) * (int64_t) sizeof(block_q4_K));
+    // HALO_TRANS layout: within each channel, uint4 element i of superblock sb
+    // of row r lives at (sb*9+i)*nrows + r (full SoA; +11% DRAM efficiency)
+    const uint4 * chx = (const uint4 *)((const block_q4_K *) vx + (int64_t) expert*stride_ch_blk);
+    const uint4 * chg = HAS_GATE ? (const uint4 *)((const block_q4_K *) vgate + (int64_t) expert*stride_ch_blk) : nullptr;
+    // TR==2 layout: dense per-instruction bursts with immediate-offset loads:
+    // element i of superblock sb of row r at (r/16)*(NSB*144) + (sb*9+i)*16 + r%16
+    const uint4 * txb = (TR == 2) ? chx + (size_t)(row >> 4)*(NSB*9*16) + (row & 15) : nullptr;
+    const uint4 * tgb = (TR == 2 && HAS_GATE) ? chg + (size_t)(row >> 4)*(NSB*9*16) + (row & 15) : nullptr;
 
     uint4 wA[9], wB[9], gA[9], gB[9];
+    if (!SB) {
 #pragma unroll
-    for (int i = 0; i < 9; ++i) { wA[i] = bx[i]; }
-    if (HAS_GATE) {
+        for (int i = 0; i < 9; ++i) { if constexpr (TR == 2) { wA[i] = txb[i*16]; } else if constexpr (TR == 1) { wA[i] = chx[(size_t) i*nrows + row]; } else { wA[i] = halo_ldw<NTM>(bx + i, xr, xoff + (unsigned)(i*16)); } }
+        if (HAS_GATE) {
 #pragma unroll
-        for (int i = 0; i < 9; ++i) { gA[i] = bg[i]; }
+            for (int i = 0; i < 9; ++i) { if constexpr (TR == 2) { gA[i] = tgb[i*16]; } else if constexpr (TR == 1) { gA[i] = chg[(size_t) i*nrows + row]; } else { gA[i] = halo_ldw<NTM>(bg + i, gr2, xoff + (unsigned)(i*16)); } }
+        }
     }
 
     float acc_x = 0.f, acc_g = 0.f;
     for (int sb = 0; sb < NSB; ++sb) {
-        if (sb + 1 < NSB) {
+        if (SB) {
 #pragma unroll
-            for (int i = 0; i < 9; ++i) { wB[i] = bx[(sb+1)*9 + i]; }
+            for (int i = 0; i < 9; ++i) { if constexpr (TR == 2) { wA[i] = txb[(size_t)(sb*9 + i)*16]; } else if constexpr (TR == 1) { wA[i] = chx[(size_t)(sb*9 + i)*nrows + row]; } else { wA[i] = halo_ldw<NTM>(bx + sb*9 + i, xr, xoff + (unsigned)((sb*9 + i)*16)); } }
             if (HAS_GATE) {
 #pragma unroll
-                for (int i = 0; i < 9; ++i) { gB[i] = bg[(sb+1)*9 + i]; }
+                for (int i = 0; i < 9; ++i) { if constexpr (TR == 2) { gA[i] = tgb[(size_t)(sb*9 + i)*16]; } else if constexpr (TR == 1) { gA[i] = chg[(size_t)(sb*9 + i)*nrows + row]; } else { gA[i] = halo_ldw<NTM>(bg + sb*9 + i, gr2, xoff + (unsigned)((sb*9 + i)*16)); } }
+            }
+        } else if (sb + 1 < NSB) {
+#pragma unroll
+            for (int i = 0; i < 9; ++i) { if constexpr (TR == 2) { wB[i] = txb[(size_t)((sb+1)*9 + i)*16]; } else if constexpr (TR == 1) { wB[i] = chx[(size_t)((sb+1)*9 + i)*nrows + row]; } else { wB[i] = halo_ldw<NTM>(bx + (sb+1)*9 + i, xr, xoff + (unsigned)(((sb+1)*9 + i)*16)); } }
+            if (HAS_GATE) {
+#pragma unroll
+                for (int i = 0; i < 9; ++i) { if constexpr (TR == 2) { gB[i] = tgb[(size_t)((sb+1)*9 + i)*16]; } else if constexpr (TR == 1) { gB[i] = chg[(size_t)((sb+1)*9 + i)*nrows + row]; } else { gB[i] = halo_ldw<NTM>(bg + (sb+1)*9 + i, gr2, xoff + (unsigned)(((sb+1)*9 + i)*16)); } }
             }
         }
         const uint32_t * yq = (const uint32_t *) &syq[(ybase/8 + sb)*256];
@@ -152,8 +234,10 @@ static __global__ void halo_mmv_q4k(
             }
             acc_g += d*sMul - dmin*sMin;
         }
+        if (!SB) {
 #pragma unroll
-        for (int i = 0; i < 9; ++i) { wA[i] = wB[i]; }
+            for (int i = 0; i < 9; ++i) { wA[i] = wB[i]; }
+        }
         if (HAS_GATE) {
 #pragma unroll
             for (int i = 0; i < 9; ++i) { gA[i] = gB[i]; }
@@ -163,6 +247,9 @@ static __global__ void halo_mmv_q4k(
     float result = acc_x;
     if (x_bias != nullptr) {
         result += x_bias[row];
+    }
+    if (ch_scale != nullptr) {
+        result *= ch_scale[c];
     }
     if (HAS_GATE) {
         switch ((ggml_glu_op) glu_op) {
@@ -181,21 +268,239 @@ static __global__ void halo_mmv_q4k(
 }
 
 
+
+// K-split variant: G adjacent lanes share one (slot,row), each owning a slice
+// of superblocks; cross-lane shfl reduce; lane slice==0 runs the epilogue.
+// Multiplies the launch grid by G — the original one-thread-one-row shape puts
+// only 24 workgroups on 80 SIMDs for gate/up (parallelism-starved, measured).
+template <int NSB, bool HAS_GATE, bool HAS_NORM, int G>
+static __global__ void halo_mmv_q4k_ks(
+        const void * __restrict__ vx, const void * __restrict__ vgate,
+        const float * __restrict__ y, const int32_t * __restrict__ ids,
+        float * __restrict__ dst,
+        const int nrows, const int nch_dst,
+        const int64_t stride_row_blk, const int64_t stride_ch_blk,
+        const int64_t stride_ch_dst, const int glu_op,
+        const int nch_y, const int64_t stride_ch_y, const float * __restrict__ x_bias,
+        const float * __restrict__ nw, const float norm_eps,
+        const float * __restrict__ ch_scale) {
+    __shared__ int8_t syq[6144];           // up to nch_y*NSB*256 (max 8*3*256)
+    __shared__ float  syd[192];
+    __shared__ float  ysm[192];
+    float rrms = 1.0f;
+    if (HAS_NORM) {   // absorbed rms_norm+mul: y is the raw residual x
+        __shared__ float s_red[HALO_WG/32];
+        __shared__ float s_rrms;
+        float ssq = 0.f;
+        for (int i2 = threadIdx.x; i2 < NSB*256; i2 += HALO_WG) {
+            const float v2 = y[i2];
+            ssq = fmaf(v2, v2, ssq);
+        }
+        ssq += __shfl_down(ssq, 16, 32);
+        ssq += __shfl_down(ssq,  8, 32);
+        ssq += __shfl_down(ssq,  4, 32);
+        ssq += __shfl_down(ssq,  2, 32);
+        ssq += __shfl_down(ssq,  1, 32);
+        if ((threadIdx.x & 31) == 0) {
+            s_red[threadIdx.x >> 5] = ssq;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t2 = 0.f;
+            for (int w2 = 0; w2 < HALO_WG/32; ++w2) {
+                t2 += s_red[w2];
+            }
+            s_rrms = rsqrtf(t2/(float)(NSB*256) + norm_eps);
+        }
+        __syncthreads();
+        rrms = s_rrms;
+    }
+    const int nsub = nch_y*NSB*8;
+    for (int s = threadIdx.x; s < nsub; s += HALO_WG) {
+        const int cy = s / (NSB*8);
+        const int ls = s % (NSB*8);
+        const float * yc = y + (int64_t) cy*stride_ch_y;
+        float amax = 0.f, sum = 0.f;
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            float v = yc[ls*32 + l];
+            if (HAS_NORM) { v = v*rrms*nw[ls*32 + l]; }
+            amax = fmaxf(amax, fabsf(v)); sum += v;
+        }
+        const float dq = amax / 127.f;
+        syd[s] = dq; ysm[s] = sum;
+        const float inv = dq > 0.f ? 1.f/dq : 0.f;
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            float vq = yc[ls*32 + l];
+            if (HAS_NORM) { vq = vq*rrms*nw[ls*32 + l]; }
+            syq[s*32 + l] = (int8_t) lrintf(vq * inv);
+        }
+    }
+    __syncthreads();
+
+    const int64_t gks = (int64_t) blockIdx.x*HALO_WG + threadIdx.x;
+    const int64_t rowid = gks / G;
+    const int slice = (int)(gks - rowid*G);
+    if (rowid >= (int64_t) nch_dst * nrows) {
+        return;
+    }
+    const int c   = (int)(rowid / nrows);
+    const int row = (int)(rowid % nrows);
+    const int expert = ids ? ids[c] : c;
+    const int cy = c % nch_y;
+    const int ybase = cy*NSB*8;
+    const uint4 * bx = (const uint4 *)((const block_q4_K *) vx + (int64_t) expert*stride_ch_blk + (int64_t) row*stride_row_blk);
+    const uint4 * bg = nullptr;
+    if (HAS_GATE) {
+        bg = (const uint4 *)((const block_q4_K *) vgate + (int64_t) expert*stride_ch_blk + (int64_t) row*stride_row_blk);
+    }
+    constexpr int SLICE_SB = (NSB + G - 1)/G;
+    const int s0 = slice*SLICE_SB;
+    const int s1 = s0 + SLICE_SB < NSB ? s0 + SLICE_SB : NSB;
+    float acc_x = 0.f, acc_g = 0.f;
+    uint4 wA[9], gA[9];
+    for (int sb = s0; sb < s1; ++sb) {
+#pragma unroll
+        for (int i = 0; i < 9; ++i) { wA[i] = bx[sb*9 + i]; }
+        if (HAS_GATE) {
+#pragma unroll
+            for (int i = 0; i < 9; ++i) { gA[i] = bg[sb*9 + i]; }
+        }
+        const uint32_t * yq = (const uint32_t *) &syq[(ybase/8 + sb)*256];
+        {
+            const uint8_t  * raw    = (const uint8_t  *) wA;
+            const float      d      = __half2float(((const __half *) raw)[0]);
+            const float      dmin   = __half2float(((const __half *) raw)[1]);
+            const uint8_t  * scales = raw + 4;
+            const uint32_t * qs32   = (const uint32_t *)(raw + 16);
+            int isum[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { isum[j] = 0; }
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    const uint32_t q = qs32[g*8 + t];
+                    isum[2*g]   = halo_dot4( q       & 0x0F0F0F0Fu, (int) yq[(2*g)*8   + t], isum[2*g]);
+                    isum[2*g+1] = halo_dot4((q >> 4) & 0x0F0F0F0Fu, (int) yq[(2*g+1)*8 + t], isum[2*g+1]);
+                }
+            }
+            float sMul = 0.f, sMin = 0.f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float sc, mn; halo_scale_min(j, scales, sc, mn);
+                sMul = fmaf(sc * syd[ybase + sb*8 + j], (float) isum[j], sMul);
+                sMin = fmaf(mn, ysm[ybase + sb*8 + j], sMin);
+            }
+            acc_x += d*sMul - dmin*sMin;
+        }
+        if (HAS_GATE) {
+        {
+            const uint8_t  * raw    = (const uint8_t  *) gA;
+            const float      d      = __half2float(((const __half *) raw)[0]);
+            const float      dmin   = __half2float(((const __half *) raw)[1]);
+            const uint8_t  * scales = raw + 4;
+            const uint32_t * qs32   = (const uint32_t *)(raw + 16);
+            int isum[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { isum[j] = 0; }
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    const uint32_t q = qs32[g*8 + t];
+                    isum[2*g]   = halo_dot4( q       & 0x0F0F0F0Fu, (int) yq[(2*g)*8   + t], isum[2*g]);
+                    isum[2*g+1] = halo_dot4((q >> 4) & 0x0F0F0F0Fu, (int) yq[(2*g+1)*8 + t], isum[2*g+1]);
+                }
+            }
+            float sMul = 0.f, sMin = 0.f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float sc, mn; halo_scale_min(j, scales, sc, mn);
+                sMul = fmaf(sc * syd[ybase + sb*8 + j], (float) isum[j], sMul);
+                sMin = fmaf(mn, ysm[ybase + sb*8 + j], sMin);
+            }
+            acc_g += d*sMul - dmin*sMin;
+        }
+        }
+    }
+#pragma unroll
+    for (int o = 1; o < G; o <<= 1) {
+        acc_x += __shfl_xor(acc_x, o, 32);
+        if (HAS_GATE) { acc_g += __shfl_xor(acc_g, o, 32); }
+    }
+    if (slice != 0) {
+        return;
+    }
+    float result = acc_x;
+    if (x_bias != nullptr) {
+        result += x_bias[row];
+    }
+    if (ch_scale != nullptr) {
+        result *= ch_scale[c];
+    }
+    if (HAS_GATE) {
+        switch ((ggml_glu_op) glu_op) {
+            case GGML_GLU_OP_SWIGLU:
+                result *= ggml_cuda_op_silu_single(acc_g);
+                break;
+            case GGML_GLU_OP_GEGLU:
+                result *= ggml_cuda_op_gelu_single(acc_g);
+                break;
+            default:
+                result *= acc_g;
+                break;
+        }
+    }
+    dst[(int64_t) c*stride_ch_dst + row] = result;
+}
+
 // ---------------- Q6_K variant (v3: Vulkan-style 16-lane cooperative) ----------------
 // 16 lanes share each superblock via 2B typed loads (alignment-immune, coalesced),
 // scales cached in LDS cooperatively, dp4a with ones-vector -32 correction.
 // Lane map (from ggml-vulkan mul_mat_vec_q6_k.comp): itid=tid%16, v_im=itid/8,
 // v_in=itid%8, l0=4*v_in; ql_off=64*v_im+l0, qh_off=32*v_im+l0, s_off=8*v_im+v_in/4.
-template <int NSB>
+template <int NSB, bool HAS_NORM>
 static __global__ void halo_mmv_q6k(
         const void * __restrict__ vx, const float * __restrict__ y,
         const int32_t * __restrict__ ids, float * __restrict__ dst,
         const int nrows, const int nch_dst,
         const int64_t stride_row_bytes, const int64_t stride_ch_bytes,
         const int64_t stride_ch_dst,
-        const int nch_y, const int64_t stride_ch_y, const float * __restrict__ x_bias) {
+        const int nch_y, const int64_t stride_ch_y, const float * __restrict__ x_bias,
+        const float * __restrict__ nw, const float norm_eps,
+        const float * __restrict__ ch_scale) {
     __shared__ int8_t syq[6144];
     __shared__ float  syd[192];
+    float rrms = 1.0f;
+    if (HAS_NORM) {   // absorbed rms_norm+mul: y is the raw residual x
+        __shared__ float s_red[HALO_WG/32];
+        __shared__ float s_rrms;
+        float ssq = 0.f;
+        for (int i2 = threadIdx.x; i2 < NSB*256; i2 += HALO_WG) {
+            const float v2 = y[i2];
+            ssq = fmaf(v2, v2, ssq);
+        }
+        ssq += __shfl_down(ssq, 16, 32);
+        ssq += __shfl_down(ssq,  8, 32);
+        ssq += __shfl_down(ssq,  4, 32);
+        ssq += __shfl_down(ssq,  2, 32);
+        ssq += __shfl_down(ssq,  1, 32);
+        if ((threadIdx.x & 31) == 0) {
+            s_red[threadIdx.x >> 5] = ssq;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t2 = 0.f;
+            for (int w2 = 0; w2 < HALO_WG/32; ++w2) {
+                t2 += s_red[w2];
+            }
+            s_rrms = rsqrtf(t2/(float)(NSB*256) + norm_eps);
+        }
+        __syncthreads();
+        rrms = s_rrms;
+    }
     const int nsub32 = nch_y*NSB*8;
     for (int s = threadIdx.x; s < nsub32; s += HALO_WG) {
         const int cy = s / (NSB*8);
@@ -204,14 +509,18 @@ static __global__ void halo_mmv_q6k(
         float amax = 0.f;
 #pragma unroll
         for (int l = 0; l < 32; ++l) {
-            amax = fmaxf(amax, fabsf(yc[ls*32 + l]));
+            float v = yc[ls*32 + l];
+            if (HAS_NORM) { v = v*rrms*nw[ls*32 + l]; }
+            amax = fmaxf(amax, fabsf(v));
         }
         const float dq = amax / 127.f;
         syd[s] = dq;
         const float inv = dq > 0.f ? 1.f/dq : 0.f;
 #pragma unroll
         for (int l = 0; l < 32; ++l) {
-            syq[s*32 + l] = (int8_t) lrintf(yc[ls*32 + l] * inv);
+            float vq = yc[ls*32 + l];
+            if (HAS_NORM) { vq = vq*rrms*nw[ls*32 + l]; }
+            syq[s*32 + l] = (int8_t) lrintf(vq * inv);
         }
     }
     __syncthreads();
@@ -292,6 +601,9 @@ static __global__ void halo_mmv_q6k(
     if (itid == 0) {
         if (x_bias != nullptr) {
             acc += x_bias[row];
+        }
+        if (ch_scale != nullptr) {
+            acc *= ch_scale[c];
         }
         dst[(int64_t) c*stride_ch_dst + row] = acc;
     }
@@ -660,6 +972,79 @@ void ggml_cuda_halo_f16(
 
 // ---- host side ----
 
+
+static __global__ void halo_add_rms_mul(
+        const float * __restrict__ a, const float * __restrict__ b,
+        const float * __restrict__ w,
+        float * __restrict__ sum_out, float * __restrict__ norm_out,
+        const int ncols, const float eps) {
+    extern __shared__ float s_buf[];   // ncols floats + 8 reduce slots
+    float * s_red2 = s_buf + ncols;
+    float ssq = 0.f;
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+        const float v = a[i] + b[i];
+        s_buf[i] = v;
+        sum_out[i] = v;
+        ssq = fmaf(v, v, ssq);
+    }
+    ssq += __shfl_down(ssq, 16, 32);
+    ssq += __shfl_down(ssq,  8, 32);
+    ssq += __shfl_down(ssq,  4, 32);
+    ssq += __shfl_down(ssq,  2, 32);
+    ssq += __shfl_down(ssq,  1, 32);
+    if ((threadIdx.x & 31) == 0) {
+        s_red2[threadIdx.x >> 5] = ssq;
+    }
+    __syncthreads();
+    float t = 0.f;
+    for (unsigned int i = 0; i < blockDim.x/32; ++i) {
+        t += s_red2[i];
+    }
+    const float rrms = rsqrtf(t/(float) ncols + eps);
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+        norm_out[i] = s_buf[i]*rrms*w[i];
+    }
+}
+
+struct halo_norm_binding {
+    const float * x;
+    const float * w;
+    float eps;
+};
+// keyed by the (skipped) rms_norm+mul output tensor of the current graph eval
+static std::unordered_map<const ggml_tensor *, halo_norm_binding> halo_norm_map;
+
+struct halo_epi_binding {
+    const float * res;   // residual to add per output row
+    float       * out;   // the (skipped) ADD's dst buffer to write instead
+};
+static std::unordered_map<const ggml_tensor *, halo_epi_binding> halo_epi_map;
+
+struct halo_moe_binding {
+    const float * w;     // per-slot expert weights (nch_dst floats)
+    float       * out;   // the (skipped) MUL's dst buffer to write instead
+};
+static std::unordered_map<const ggml_tensor *, halo_moe_binding> halo_moe_map;
+
+void ggml_cuda_halo_norm_clear() {
+    halo_norm_map.clear();
+    halo_epi_map.clear();
+    halo_moe_map.clear();
+}
+
+static void ggml_cuda_halo_norm_fetch(const ggml_tensor * src1, const float ** y_arg, const float ** nw, float * eps) {
+    if (halo_norm_map.empty()) {
+        return;
+    }
+    const auto it = halo_norm_map.find(src1);
+    if (it == halo_norm_map.end()) {
+        return;
+    }
+    *y_arg = it->second.x;
+    *nw    = it->second.w;
+    *eps   = it->second.eps;
+}
+
 bool ggml_cuda_halo_mmvq_supported(
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         const ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -667,7 +1052,7 @@ bool ggml_cuda_halo_mmvq_supported(
         return false;
     }
     const bool dbg = getenv("HALO_DEBUG") != nullptr;
-#define HALO_REJ(why) do { if (dbg) fprintf(stderr, "halo-rej %s k=%lld r=%lld ids=%d ne1=%lld sne1=%lld sne2=%lld fus=%d gate=%d\n", why, (long long)src0->ne[0], (long long)src0->ne[1], ids?1:0, (long long)dst->ne[1], (long long)src1->ne[1], (long long)src1->ne[2], fusion?1:0, (fusion&&fusion->gate)?1:0); return false; } while(0)
+#define HALO_REJ(why) do { if (halo_norm_map.count(src1) != 0 || halo_epi_map.count(dst) != 0 || halo_moe_map.count(dst) != 0) { GGML_ABORT("halo: norm-bound matvec rejected at exec (%s)", why); } if (dbg) fprintf(stderr, "halo-rej %s k=%lld r=%lld ids=%d ne1=%lld sne1=%lld sne2=%lld fus=%d gate=%d\n", why, (long long)src0->ne[0], (long long)src0->ne[1], ids?1:0, (long long)dst->ne[1], (long long)src1->ne[1], (long long)src1->ne[2], fusion?1:0, (fusion&&fusion->gate)?1:0); return false; } while(0)
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (!GGML_CUDA_CC_IS_RDNA3_5(cc)) {
@@ -680,8 +1065,9 @@ bool ggml_cuda_halo_mmvq_supported(
         if (getenv("HALO_Q6_DISABLE") != nullptr) {
             return false;
         }
-        if (ids && (src0->nb[1] % 16) != 0) {
-            HALO_REJ("q6idsalign");   // stock beats v3 on misaligned expert rows
+        static const bool q6_ids_force = getenv("HALO_Q6_IDS_FORCE") != nullptr;
+        if (ids && (src0->nb[1] % 16) != 0 && !q6_ids_force) {
+            HALO_REJ("q6idsalign");   // stock beats v3 on misaligned expert rows (solo; HALO_Q6_IDS_FORCE re-tests under concurrency)
         }
         if (fusion && fusion->gate) {
             HALO_REJ("q6gate");
@@ -713,7 +1099,8 @@ bool ggml_cuda_halo_mmvq_supported(
         if (dst->ne[1] != 1 || dst->ne[2] != 1 || src0->ne[2] != 1) {
             HALO_REJ("denseshape");
         }
-        if (src0->ne[1] < (src0->type == GGML_TYPE_Q6_K ? 128 : 1024)) {
+        static const int q4_min_rows = getenv("HALO_Q4_MINROWS") ? atoi(getenv("HALO_Q4_MINROWS")) : 512;
+        if (src0->ne[1] < (src0->type == GGML_TYPE_Q6_K ? 128 : q4_min_rows)) {
             HALO_REJ("denserows");
         }
         if ((k/256) * 256 > 6144) {
@@ -759,12 +1146,34 @@ void ggml_cuda_halo_mmvq(
     const void * gate = (fusion && fusion->gate) ? fusion->gate->data : nullptr;
     const int glu_op = (fusion && fusion->gate) ? (int) fusion->glu_op : 0;
     const float * x_bias = (fusion && fusion->x_bias) ? (const float *) fusion->x_bias->data : nullptr;
+    float * dst_data = (float *) dst->data;
+    const float * ch_scale = nullptr;
+    if (ids && !halo_moe_map.empty()) {
+        const auto mit = halo_moe_map.find(dst);
+        if (mit != halo_moe_map.end()) {   // absorbed combine MUL: scale per slot, write MUL's buffer
+            ch_scale = mit->second.w;
+            dst_data = mit->second.out;
+        }
+    }
+    if (!ids && x_bias == nullptr && !halo_epi_map.empty()) {
+        const auto eit = halo_epi_map.find(dst);
+        if (eit != halo_epi_map.end()) {   // absorbed residual ADD: add res, write the ADD's buffer
+            x_bias   = eit->second.res;
+            dst_data = eit->second.out;
+        }
+    }
 
     const int64_t total  = nch_dst * nrows;
     const int     blocks = (int)((total + HALO_WG - 1) / HALO_WG);
     cudaStream_t  stream = ctx.stream();
 
     const int32_t * ids_d = ids ? (const int32_t *) ids->data : nullptr;
+    const float * y_arg  = (const float *) src1->data;
+    const float * nw_arg = nullptr;
+    float         neps   = 0.f;
+    if (!ids) {
+        ggml_cuda_halo_norm_fetch(src1, &y_arg, &nw_arg, &neps);
+    }
     if (src0->type == GGML_TYPE_Q6_K) {
         const int64_t srb = src0->nb[1];
         const int64_t scb = src0->nb[2];
@@ -782,22 +1191,581 @@ void ggml_cuda_halo_mmvq(
             }
         }
         const int q6blocks = (int)((total*16 + HALO_WG - 1) / HALO_WG);
-#define HALO_LAUNCH6(NSBV)         halo_mmv_q6k<NSBV><<<q6blocks, HALO_WG, 0, stream>>>(             src0->data, (const float *) src1->data, ids_d, (float *) dst->data,             (int) nrows, (int) nch_dst, srb, scb, stride_ch_dst, nch_y, stride_ch_y, x_bias)
+#define HALO_LAUNCH6(NSBV, NORMV)         halo_mmv_q6k<NSBV, NORMV><<<q6blocks, HALO_WG, 0, stream>>>(             src0->data, y_arg, ids_d, dst_data,             (int) nrows, (int) nch_dst, srb, scb, stride_ch_dst, nch_y, stride_ch_y, x_bias, nw_arg, neps, ch_scale)
         switch (k) {
-            case 2048: HALO_LAUNCH6(8);  break;
-            case  768: HALO_LAUNCH6(3);  break;
-            case 4096: HALO_LAUNCH6(16); break;
+            case 2048: if (nw_arg) { HALO_LAUNCH6(8,  true); } else { HALO_LAUNCH6(8,  false); } break;
+            case  768: if (nw_arg) { HALO_LAUNCH6(3,  true); } else { HALO_LAUNCH6(3,  false); } break;
+            case 4096: if (nw_arg) { HALO_LAUNCH6(16, true); } else { HALO_LAUNCH6(16, false); } break;
             default: GGML_ABORT("halo q6: unsupported k");
         }
 #undef HALO_LAUNCH6
         return;
     }
-#define HALO_LAUNCH(NSBV, GATEV, GATEPTR, GLUV)     halo_mmv_q4k<NSBV, GATEV><<<blocks, HALO_WG, 0, stream>>>(         src0->data, GATEPTR, (const float *) src1->data, ids_d,         (float *) dst->data, (int) nrows, (int) nch_dst, stride_row_blk, stride_ch_blk,         stride_ch_dst, GLUV, nch_y, stride_ch_y, x_bias)
+#define HALO_LAUNCH(NSBV, GATEV, NORMV, SBV, GATEPTR, GLUV)     do { if (halo_ksplit) { halo_mmv_q4k_ks<NSBV, GATEV, NORMV, (NSBV == 16 ? 8 : 4)><<<(unsigned)(((int64_t) nch_dst*(int64_t) nrows*(NSBV == 16 ? 8 : 4) + HALO_WG - 1)/HALO_WG), HALO_WG, 0, stream>>>(         src0->data, GATEPTR, y_arg, ids_d,         dst_data, (int) nrows, (int) nch_dst, stride_row_blk, stride_ch_blk,         stride_ch_dst, GLUV, nch_y, stride_ch_y, x_bias, nw_arg, neps, ch_scale); } else if (halo_trans == 2) { halo_mmv_q4k<NSBV, GATEV, NORMV, SBV, 0, 2><<<blocks, HALO_WG, 0, stream>>>(         src0->data, GATEPTR, y_arg, ids_d,         dst_data, (int) nrows, (int) nch_dst, stride_row_blk, stride_ch_blk,         stride_ch_dst, GLUV, nch_y, stride_ch_y, x_bias, nw_arg, neps, ch_scale); } else if (halo_trans == 1) { halo_mmv_q4k<NSBV, GATEV, NORMV, SBV, 0, 1><<<blocks, HALO_WG, 0, stream>>>(         src0->data, GATEPTR, y_arg, ids_d,         dst_data, (int) nrows, (int) nch_dst, stride_row_blk, stride_ch_blk,         stride_ch_dst, GLUV, nch_y, stride_ch_y, x_bias, nw_arg, neps, ch_scale); } else switch (halo_ntmode) { case 1: halo_mmv_q4k<NSBV, GATEV, NORMV, SBV, 1, 0><<<blocks, HALO_WG, 0, stream>>>(         src0->data, GATEPTR, y_arg, ids_d,         dst_data, (int) nrows, (int) nch_dst, stride_row_blk, stride_ch_blk,         stride_ch_dst, GLUV, nch_y, stride_ch_y, x_bias, nw_arg, neps, ch_scale); break; case 2: halo_mmv_q4k<NSBV, GATEV, NORMV, SBV, 2, 0><<<blocks, HALO_WG, 0, stream>>>(         src0->data, GATEPTR, y_arg, ids_d,         dst_data, (int) nrows, (int) nch_dst, stride_row_blk, stride_ch_blk,         stride_ch_dst, GLUV, nch_y, stride_ch_y, x_bias, nw_arg, neps, ch_scale); break; case 3: halo_mmv_q4k<NSBV, GATEV, NORMV, SBV, 3, 0><<<blocks, HALO_WG, 0, stream>>>(         src0->data, GATEPTR, y_arg, ids_d,         dst_data, (int) nrows, (int) nch_dst, stride_row_blk, stride_ch_blk,         stride_ch_dst, GLUV, nch_y, stride_ch_y, x_bias, nw_arg, neps, ch_scale); break; case 4: halo_mmv_q4k<NSBV, GATEV, NORMV, SBV, 4, 0><<<blocks, HALO_WG, 0, stream>>>(         src0->data, GATEPTR, y_arg, ids_d,         dst_data, (int) nrows, (int) nch_dst, stride_row_blk, stride_ch_blk,         stride_ch_dst, GLUV, nch_y, stride_ch_y, x_bias, nw_arg, neps, ch_scale); break; default: halo_mmv_q4k<NSBV, GATEV, NORMV, SBV, 0, 0><<<blocks, HALO_WG, 0, stream>>>(         src0->data, GATEPTR, y_arg, ids_d,         dst_data, (int) nrows, (int) nch_dst, stride_row_blk, stride_ch_blk,         stride_ch_dst, GLUV, nch_y, stride_ch_y, x_bias, nw_arg, neps, ch_scale); break; } } while (0)
+    static const int halo_sb = getenv("HALO_SB") ? atoi(getenv("HALO_SB")) : 1;   // 0 off, 1 short-k, 2 all, 3 gate+short-k
+    static const int halo_nt = getenv("HALO_NT") ? atoi(getenv("HALO_NT")) : 0;
+    static const int halo_mall = getenv("HALO_MALL") ? atoi(getenv("HALO_MALL")) : 0;
+    static const int halo_trans = getenv("HALO_TRANS") ? atoi(getenv("HALO_TRANS")) : 0;
+    static const int halo_ksplit = getenv("HALO_KSPLIT") ? atoi(getenv("HALO_KSPLIT")) : 0;
+    const int halo_ntmode = halo_nt ? halo_nt : (((halo_mall == 1 || halo_mall == 2) && ids_d != nullptr) ? 2 : 0);
+    const bool sb_all  = halo_sb == 2;
+    const bool sb_gate = halo_sb == 2 || halo_sb == 3;
+    const bool sb_768  = halo_sb >= 1;
     switch (k) {
-        case 2048: if (gate) { HALO_LAUNCH(8,  true, gate, glu_op); } else { HALO_LAUNCH(8,  false, nullptr, 0); } break;
-        case  768: if (gate) { HALO_LAUNCH(3,  true, gate, glu_op); } else { HALO_LAUNCH(3,  false, nullptr, 0); } break;
-        case 4096: if (gate) { HALO_LAUNCH(16, true, gate, glu_op); } else { HALO_LAUNCH(16, false, nullptr, 0); } break;
+        case 2048: if (gate) { if (sb_gate) { HALO_LAUNCH(8,  true, false, true, gate, glu_op); } else { HALO_LAUNCH(8,  true, false, false, gate, glu_op); } }
+                   else if (nw_arg) { HALO_LAUNCH(8,  false, true, false, nullptr, 0); }
+                   else if (sb_all) { HALO_LAUNCH(8,  false, false, true, nullptr, 0); }
+                   else { HALO_LAUNCH(8,  false, false, false, nullptr, 0); } break;
+        case  768: if (gate) { HALO_LAUNCH(3,  true, false, false, gate, glu_op); }
+                   else if (nw_arg) { HALO_LAUNCH(3,  false, true, false, nullptr, 0); }
+                   else if (sb_768) { HALO_LAUNCH(3,  false, false, true, nullptr, 0); }
+                   else { HALO_LAUNCH(3,  false, false, false, nullptr, 0); } break;
+        case 4096: if (gate) { HALO_LAUNCH(16, true, false, false, gate, glu_op); }
+                   else if (nw_arg) { HALO_LAUNCH(16, false, true, false, nullptr, 0); }
+                   else if (sb_all) { HALO_LAUNCH(16, false, false, true, nullptr, 0); }
+                   else { HALO_LAUNCH(16, false, false, false, nullptr, 0); } break;
         default: GGML_ABORT("halo: unsupported k");
     }
 #undef HALO_LAUNCH
+}
+
+// Absorb a decode-time RMS_NORM+MUL pair into the halo matvecs that consume it.
+// The consumers recompute the norm in their staging prologue, so this only pays
+// when the consumers launch FEW workgroups (each workgroup repeats the reduce):
+// the attn q/k/v trio is ~100 blocks total and wins; the 19k-block lm_head
+// loses badly (measured -2.5 t/s) and is rejected by the block-count gate.
+// The MUL is searched in a small window after the RMS_NORM because the stream
+// concurrency optimizer reorders in-layer nodes. Opt-in via HALO_NORM_ABSORB=1.
+bool ggml_cuda_halo_try_norm(const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list) {
+    static const bool en = (getenv("HALO_NORM_ABSORB") == nullptr || atoi(getenv("HALO_NORM_ABSORB")) != 0) && getenv("HALO_QKV_ENABLE") == nullptr;   // default on: +0.6 t/s under stream concurrency (A/B x3 2026-08-27); absorbed norm recomputed in-kernel
+    if (!en) {
+        return false;
+    }
+    const bool dbg = getenv("HALO_DEBUG") != nullptr;
+    const ggml_tensor * rn = cgraph->nodes[i];
+    if (rn->op != GGML_OP_RMS_NORM || i + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * x = rn->src[0];
+    if (rn->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (rn->ne[1] != 1 || rn->ne[2] != 1 || rn->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(x) || ggml_nelements(x) != rn->ne[0]) {
+        return false;
+    }
+    // find the MUL(rn, w) within a short window (optimizer may interleave)
+    ggml_tensor * ml = nullptr;
+    const int wlim = i + 5 < cgraph->n_nodes ? i + 5 : cgraph->n_nodes;
+    for (int j = i + 1; j < wlim; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_MUL && n->src[0] == rn) {
+            ml = n;
+            break;
+        }
+    }
+    if (ml == nullptr) {
+        if (dbg) {
+            static int nadj = 0;
+            if (nadj++ < 6) {
+                const ggml_tensor * nx = cgraph->nodes[i + 1];
+                fprintf(stderr, "halo-norm-noadj rn=%s next=%s op=%s\n", rn->name, nx->name, ggml_op_name(nx->op));
+            }
+        }
+        return false;
+    }
+    const ggml_tensor * w = ml->src[1];
+    if (w->type != GGML_TYPE_F32 || ml->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || !ggml_is_contiguous(ml)) {
+        return false;
+    }
+    if (w->ne[0] != rn->ne[0] || ggml_nelements(w) != rn->ne[0]) {
+        return false;
+    }
+    // every later use of rn or ml (directly or through a view) must be a
+    // halo-accepted dense matvec consuming ml as src1; total launch blocks
+    // across consumers must stay small (each block repeats the norm reduce)
+    int nconsumers = 0;
+    int64_t blocks = 0;
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n == ml) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            for (const ggml_tensor * vs = src->view_src; vs != nullptr; vs = vs->view_src) {
+                if (vs == rn || vs == ml) {
+                    return false;
+                }
+            }
+            if (src == rn) {
+                return false;
+            }
+            if (src == ml) {
+                if (n->op != GGML_OP_MUL_MAT || s != 1) {
+                    if (dbg) {
+                        static int nrej1 = 0;
+                        if (nrej1++ < 6) {
+                            fprintf(stderr, "halo-norm-rej w=%s consumer=%s op=%s s=%d\n", w->name, n->name, ggml_op_name(n->op), s);
+                        }
+                    }
+                    return false;
+                }
+                if (!ggml_cuda_halo_mmvq_supported(n->src[0], ml, nullptr, n, nullptr)) {
+                    if (dbg) {
+                        static int nrej2 = 0;
+                        if (nrej2++ < 6) {
+                            fprintf(stderr, "halo-norm-rej w=%s consumer-w=%s type=%d r=%lld unsupported\n", w->name, n->src[0]->name, (int) n->src[0]->type, (long long) n->src[0]->ne[1]);
+                        }
+                    }
+                    return false;
+                }
+                const int64_t nrows = n->src[0]->ne[1];
+                blocks += (n->src[0]->type == GGML_TYPE_Q6_K) ? (nrows*16 + 127)/128 : (nrows + 127)/128;
+                ++nconsumers;
+            }
+        }
+    }
+    if (nconsumers == 0) {
+        return false;
+    }
+    if (blocks > 256) {
+        if (dbg) {
+            static int nbig = 0;
+            if (nbig++ < 6) {
+                fprintf(stderr, "halo-norm-toobig w=%s consumers=%d blocks=%lld\n", w->name, nconsumers, (long long) blocks);
+            }
+        }
+        return false;
+    }
+    float eps;
+    memcpy(&eps, rn->op_params, sizeof(float));
+    if (dbg) {
+        static int nreg = 0;
+        if (nreg++ < 6) {
+            fprintf(stderr, "halo-norm-absorb: w=%s k=%lld consumers=%d blocks=%lld eps=%g\n", w->name, (long long) rn->ne[0], nconsumers, (long long) blocks, eps);
+        }
+    }
+    halo_norm_map[ml] = { (const float *) x->data, (const float *) w->data, eps };
+    skip_list.push_back(ml);   // rn (the current node) is skipped by the caller
+    return true;
+}
+
+// Absorb a decode-time residual ADD into the halo matvec x_bias epilogue:
+// MUL_MAT (halo-accepted dense) whose dst's SOLE consumer is a same-shape
+// f32 ADD. The matvec then writes the ADD's buffer directly with the
+// residual added per row (deterministic: each thread owns its row).
+// Opt-in via HALO_EPI=1. Mutually exclusive with HALO_QKV_ENABLE.
+bool ggml_cuda_halo_try_epi(const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list) {
+    static const bool en = getenv("HALO_EPI") != nullptr && getenv("HALO_QKV_ENABLE") == nullptr;
+    if (!en) {
+        return false;
+    }
+    const ggml_tensor * mm = cgraph->nodes[i];
+    if (mm->op != GGML_OP_MUL_MAT || i + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    if (mm->ne[1] != 1 || mm->ne[2] != 1) {
+        return false;
+    }
+    // find the sole ADD consumer within a short window
+    ggml_tensor * ad = nullptr;
+    const int wlim = i + 5 < cgraph->n_nodes ? i + 5 : cgraph->n_nodes;
+    for (int j = i + 1; j < wlim; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_ADD && (n->src[0] == mm || n->src[1] == mm)) {
+            ad = n;
+            break;
+        }
+    }
+    if (ad == nullptr) {
+        return false;
+    }
+    const ggml_tensor * res = ad->src[0] == mm ? ad->src[1] : ad->src[0];
+    if (ad->type != GGML_TYPE_F32 || res->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(ad, mm) || !ggml_are_same_shape(res, mm)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(res) || !ggml_is_contiguous(ad) || !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    if (!ggml_cuda_halo_mmvq_supported(mm->src[0], mm->src[1], nullptr, mm, nullptr)) {
+        return false;
+    }
+    // mm's dst must have NO other consumer than ad, directly or via views
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n == ad) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            if (src == mm) {
+                return false;
+            }
+            for (const ggml_tensor * vs = src->view_src; vs != nullptr; vs = vs->view_src) {
+                if (vs == mm) {
+                    return false;
+                }
+            }
+        }
+    }
+    if (getenv("HALO_DEBUG") != nullptr) {
+        static int nreg = 0;
+        if (nreg++ < 4) {
+            fprintf(stderr, "halo-epi-absorb: mm=%s r=%lld add=%s\n", mm->name, (long long) mm->src[0]->ne[1], ad->name);
+        }
+    }
+    halo_epi_map[mm] = { (const float *) res->data, (float *) ad->data };
+    skip_list.push_back(ad);
+    return false;   // the MUL_MAT node itself still executes (via the halo hook)
+}
+
+// Absorb the MoE combine MUL (per-slot expert weights) into the halo
+// MUL_MAT_ID store: dst[slot][row] = acc * w[slot], writing the MUL's
+// buffer directly. Deterministic and bit-identical to the separate MUL.
+// Opt-in via HALO_MOE_MUL=1. Mutually exclusive with HALO_QKV_ENABLE.
+bool ggml_cuda_halo_try_moe(const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list) {
+    static const bool en = (getenv("HALO_MOE_MUL") == nullptr || atoi(getenv("HALO_MOE_MUL")) != 0) && getenv("HALO_QKV_ENABLE") == nullptr;   // default on: +0.6 t/s, bit-identical
+    if (!en) {
+        return false;
+    }
+    const ggml_tensor * mm = cgraph->nodes[i];
+    if (mm->op != GGML_OP_MUL_MAT_ID || i + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    if (mm->ne[2] != 1 || mm->type != GGML_TYPE_F32) {
+        return false;
+    }
+    ggml_tensor * ml = nullptr;
+    const int wlim = i + 5 < cgraph->n_nodes ? i + 5 : cgraph->n_nodes;
+    for (int j = i + 1; j < wlim; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_MUL && n->src[0] == mm) {
+            ml = n;
+            break;
+        }
+    }
+    if (ml == nullptr) {
+        return false;
+    }
+    const ggml_tensor * w = ml->src[1];
+    if (ml->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // w broadcasts one scalar per slot: [1, nch, 1]
+    if (w->ne[0] != 1 || w->ne[1] != mm->ne[1] || ggml_nelements(w) != mm->ne[1]) {
+        return false;
+    }
+    if (!ggml_is_contiguous(w) || !ggml_is_contiguous(ml) || !ggml_is_contiguous(mm) || !ggml_are_same_shape(ml, mm)) {
+        return false;
+    }
+    if (!ggml_cuda_halo_mmvq_supported(mm->src[0], mm->src[1], mm->src[2], mm, nullptr)) {
+        return false;
+    }
+    // mm's dst must have NO other consumer than ml, directly or via views
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n == ml) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            if (src == mm) {
+                return false;
+            }
+            for (const ggml_tensor * vs = src->view_src; vs != nullptr; vs = vs->view_src) {
+                if (vs == mm) {
+                    return false;
+                }
+            }
+        }
+    }
+    if (getenv("HALO_DEBUG") != nullptr) {
+        static int nreg = 0;
+        if (nreg++ < 4) {
+            fprintf(stderr, "halo-moe-absorb: mm=%s nch=%lld mul=%s\n", mm->name, (long long) mm->ne[1], ml->name);
+        }
+    }
+    halo_moe_map[mm] = { (const float *) w->data, (float *) ml->data };
+    skip_list.push_back(ml);
+    return false;   // mm itself still executes via the halo hook
+}
+
+// Fuse decode-time [residual ADD] + [RMS_NORM + MUL] into one kernel that
+// writes both the sum and the normed output. Opt-in via HALO_ADDNORM=1.
+bool ggml_cuda_halo_try_addnorm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
+                                std::vector<const ggml_tensor *> & skip_list) {
+    static const bool en = getenv("HALO_ADDNORM") != nullptr;
+    if (!en) {
+        return false;
+    }
+    const ggml_tensor * ad = cgraph->nodes[i];
+    if (ad->op != GGML_OP_ADD || i + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    if (ad->type != GGML_TYPE_F32 || ad->ne[1] != 1 || ad->ne[2] != 1 || ad->ne[3] != 1) {
+        return false;
+    }
+    const ggml_tensor * a = ad->src[0];
+    const ggml_tensor * b = ad->src[1];
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(a, ad) || !ggml_are_same_shape(b, ad) ||
+        !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(ad)) {
+        return false;
+    }
+    // find RMS_NORM(ad) then MUL(rms, w) in a short window
+    const ggml_tensor * rn = nullptr;
+    ggml_tensor * ml = nullptr;
+    const int wlim = i + 5 < cgraph->n_nodes ? i + 5 : cgraph->n_nodes;
+    for (int j = i + 1; j < wlim; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (rn == nullptr && n->op == GGML_OP_RMS_NORM && n->src[0] == ad) {
+            rn = n;
+            continue;
+        }
+        if (rn != nullptr && n->op == GGML_OP_MUL && n->src[0] == rn) {
+            ml = n;
+            break;
+        }
+    }
+    if (rn == nullptr || ml == nullptr) {
+        return false;
+    }
+    const ggml_tensor * w = ml->src[1];
+    if (rn->type != GGML_TYPE_F32 || ml->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (w->ne[0] != ad->ne[0] || ggml_nelements(w) != ad->ne[0] ||
+        !ggml_is_contiguous(w) || !ggml_is_contiguous(ml) || !ggml_is_contiguous(rn)) {
+        return false;
+    }
+    // rn must have no consumer other than ml (the sum ad may have many - we write it)
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n == ml) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            if (src == rn) {
+                return false;
+            }
+            for (const ggml_tensor * vs = src->view_src; vs != nullptr; vs = vs->view_src) {
+                if (vs == rn || vs == ml) {
+                    return false;
+                }
+            }
+        }
+    }
+    float eps;
+    memcpy(&eps, rn->op_params, sizeof(float));
+    const int ncols = (int) ad->ne[0];
+    const int nthreads = 256;
+    const size_t lds = (size_t) ncols*sizeof(float) + 8*sizeof(float);
+    halo_add_rms_mul<<<1, nthreads, lds, ctx.stream()>>>(
+        (const float *) a->data, (const float *) b->data, (const float *) w->data,
+        (float *) ad->data, (float *) ml->data, ncols, eps);
+    if (getenv("HALO_DEBUG") != nullptr) {
+        static int nreg = 0;
+        if (nreg++ < 4) {
+            fprintf(stderr, "halo-addnorm: add=%s norm=%s\n", ad->name, ml->name);
+        }
+    }
+    skip_list.push_back(rn);
+    skip_list.push_back(ml);
+    return true;   // the ADD node itself is replaced by this launch
+}
+
+// ---- HALO_MALL: software-managed MALL ----
+// 1 = slc on expert (MUL_MAT_ID) weight streams only: stop the ~1.9GB/token
+//     single-use expert wash from evicting reusable data out of L2/MALL.
+// 2 = additionally fire-and-forget prefetch of the next attention block's
+//     weights on a side stream at each layer's down-projection, so the attn
+//     matvecs hit MALL instead of DRAM. Joined one trigger later (capture-safe).
+// 3 = prefetch only (no slc).
+static __global__ void halo_prefetch_k(const uint4 * __restrict__ p, unsigned n128, int * sink) {
+    unsigned acc = 0;
+    const unsigned stride = gridDim.x*blockDim.x;
+    for (unsigned i = blockIdx.x*blockDim.x + threadIdx.x; i < n128; i += stride) {
+        const uint4 v = p[i];
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == 0xdeadbeefu) { *sink = (int) acc; }
+}
+
+struct halo_pf_item { const void * ptr; unsigned n128; };
+
+void ggml_cuda_halo_try_prefetch(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const int en0 = getenv("HALO_MALL") ? atoi(getenv("HALO_MALL")) : 0;
+    if (en0 < 2) {
+        return;
+    }
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_MUL_MAT_ID) {
+        return;
+    }
+    static long long cur_uid = -9;
+    static std::unordered_map<int, std::vector<halo_pf_item>> pf;   // down-node idx -> next window's weights
+    static int last_trigger = -1;
+    static bool pending = false;
+    if ((long long) cgraph->uid != cur_uid || cgraph->uid == 0) {
+        cur_uid = (long long) cgraph->uid;
+        pf.clear();
+        last_trigger = -1;
+        pending = false;
+        std::vector<int> downs;
+        for (int k = 0; k < cgraph->n_nodes; ++k) {
+            if (cgraph->nodes[k]->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            int nxt = -1;
+            for (int j = k + 1; j < cgraph->n_nodes && j < k + 8; ++j) {
+                if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT_ID) { nxt = j; break; }
+            }
+            if (nxt < 0) {   // last MUL_MAT_ID of its layer = the down projection
+                downs.push_back(k);
+            }
+        }
+        for (size_t t = 0; t + 1 < downs.size(); ++t) {   // skip the last down: nothing later to join it at
+            std::vector<halo_pf_item> & vec = pf[downs[t]];
+            for (int k = downs[t] + 1; k < downs[t+1]; ++k) {
+                const ggml_tensor * n = cgraph->nodes[k];
+                if (n->op != GGML_OP_MUL_MAT || n->src[0] == nullptr) { continue; }
+                const ggml_tensor * w = n->src[0];
+                if (!ggml_is_quantized(w->type) || w->ne[1] <= 256) { continue; }
+                const size_t bytes = ggml_nbytes(w);
+                if (bytes < (1u << 20) || bytes > (32u << 20)) { continue; }   // MALL-sized targets only
+                halo_pf_item item; item.ptr = w->data; item.n128 = (unsigned)(bytes/16);
+                vec.push_back(item);
+            }
+        }
+        if (!downs.empty()) { last_trigger = downs.back(); }
+        if (getenv("HALO_DEBUG") != nullptr) {
+            size_t tot = 0;
+            for (const auto & kv : pf) { for (const auto & it2 : kv.second) { tot += (size_t) it2.n128 * 16; } }
+            fprintf(stderr, "halo-prefetch: %zu triggers, %.1f MB/token%c", pf.size(), tot/1e6, 10);
+        }
+    }
+    static hipStream_t ps = nullptr;
+    static hipEvent_t ef = nullptr, ej = nullptr;
+    static int * sink = nullptr;
+    if (ps == nullptr) {
+        hipStreamCreateWithFlags(&ps, hipStreamNonBlocking);
+        hipEventCreateWithFlags(&ef, hipEventDisableTiming);
+        hipEventCreateWithFlags(&ej, hipEventDisableTiming);
+        hipMalloc(&sink, 4);
+    }
+    std::unordered_map<int, std::vector<halo_pf_item>>::const_iterator it = pf.find(i);
+    if (it == pf.end() && i != last_trigger) {
+        return;
+    }
+    if (pending) {   // join the previous layer's prefetch before starting a new one
+        hipStreamWaitEvent(ctx.stream(), ej, 0);
+        pending = false;
+    }
+    if (it == pf.end() || it->second.empty()) {
+        return;
+    }
+    hipEventRecord(ef, ctx.stream());
+    hipStreamWaitEvent(ps, ef, 0);
+    for (const halo_pf_item & pr : it->second) {
+        halo_prefetch_k<<<40, 256, 0, ps>>>((const uint4 *) pr.ptr, pr.n128, sink);
+    }
+    hipEventRecord(ej, ps);
+    pending = true;
+}
+
+// ---- HALO_TRANS: one-time SoA transpose of Q4_K weight tensors ----
+// Canonical: within a channel, uint4 element i of superblock sb of row r is at
+// (r*nsb + sb)*9 + i. Transposed: (sb*9 + i)*nrows + r — at decode every wave
+// instruction then reads consecutive 16B elements (dense bursts; measured
+// 228 vs 205 GB/s on the raw shape). Runs BEFORE graph capture begins.
+static __global__ void halo_transpose_q4k(const uint4 * __restrict__ in, uint4 * __restrict__ out,
+                                          const int nsb, const int nrows, const int64_t nu4_per_ch, const int nch) {
+    const int64_t total = nu4_per_ch * nch;
+    const int64_t stride = (int64_t) gridDim.x*blockDim.x;
+    for (int64_t o = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; o < total; o += stride) {
+        const int c = (int)(o / nu4_per_ch);
+        const int64_t r = o - (int64_t) c*nu4_per_ch;
+        const int sbi = (int)(r / nrows);
+        const int row = (int)(r - (int64_t) sbi*nrows);
+        const int sb = sbi / 9, ii = sbi - sb*9;
+        out[o] = in[(int64_t) c*nu4_per_ch + ((int64_t) row*nsb + sb)*9 + ii];
+    }
+}
+
+static __global__ void halo_transpose_q4k_blk(const uint4 * __restrict__ in, uint4 * __restrict__ out,
+                                              const int nsb, const int nrows, const int64_t nu4_per_ch, const int nch) {
+    const int64_t total = nu4_per_ch * nch;
+    const int64_t stride = (int64_t) gridDim.x*blockDim.x;
+    const int64_t blkspan = (int64_t) nsb*144;   // nsb*9*16 uint4 per 16-row group
+    for (int64_t o = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; o < total; o += stride) {
+        const int c = (int)(o / nu4_per_ch);
+        const int64_t r = o - (int64_t) c*nu4_per_ch;
+        const int rb = (int)(r / blkspan);
+        const int rem = (int)(r - (int64_t) rb*blkspan);
+        const int sbi = rem >> 4, r16 = rem & 15;
+        const int sb = sbi / 9, ii = sbi - sb*9;
+        const int row = rb*16 + r16;
+        out[o] = in[(int64_t) c*nu4_per_ch + ((int64_t) row*nsb + sb)*9 + ii];
+    }
+}
+
+void ggml_cuda_halo_pretranspose(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
+    static const int en0 = getenv("HALO_TRANS") ? atoi(getenv("HALO_TRANS")) : 0;
+    if (!en0) {
+        return;
+    }
+    static std::unordered_set<const void *> done;
+    static void * tmp = nullptr;
+    static size_t tmp_sz = 0;
+    static const int q4_min_rows2 = getenv("HALO_Q4_MINROWS") ? atoi(getenv("HALO_Q4_MINROWS")) : 512;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op != GGML_OP_MUL_MAT && n->op != GGML_OP_MUL_MAT_ID) { continue; }
+        const ggml_tensor * w = n->src[0];
+        if (w == nullptr || w->type != GGML_TYPE_Q4_K || w->data == nullptr) { continue; }
+        const int64_t k = w->ne[0];
+        if (k != 2048 && k != 768 && k != 4096) { continue; }
+        if (w->ne[1] < q4_min_rows2) { continue; }   // small tensors stay canonical (halo skips them too)
+        if (en0 == 2 && (w->ne[1] & 15) != 0) { fprintf(stderr, "halo-trans: SKIP %s rows not mult16%c", w->name, 10); continue; }
+        if (done.count(w->data)) { continue; }
+        const size_t bytes = ggml_nbytes(w);
+        if (bytes > tmp_sz) {
+            if (tmp != nullptr) { hipFree(tmp); }
+            if (hipMalloc(&tmp, bytes) != hipSuccess) { tmp = nullptr; tmp_sz = 0; return; }
+            tmp_sz = bytes;
+        }
+        const int nsb = (int)(k/256);
+        const int nrows = (int) w->ne[1];
+        const int nch = (int)(w->ne[2] > 0 ? w->ne[2] : 1);
+        const int64_t nu4 = (int64_t) nsb*9*nrows;
+        if (en0 == 2) {
+            halo_transpose_q4k_blk<<<512, 256, 0, ctx.stream()>>>((const uint4 *) w->data, (uint4 *) tmp, nsb, nrows, nu4, nch);
+        } else {
+            halo_transpose_q4k<<<512, 256, 0, ctx.stream()>>>((const uint4 *) w->data, (uint4 *) tmp, nsb, nrows, nu4, nch);
+        }
+        hipMemcpyAsync(w->data, tmp, bytes, hipMemcpyDeviceToDevice, ctx.stream());
+        done.insert(w->data);
+        if (getenv("HALO_DEBUG") != nullptr) {
+            fprintf(stderr, "halo-trans: %s k=%lld rows=%d ch=%d (%zu MB)%c", w->name, (long long) k, nrows, nch, bytes >> 20, 10);
+        }
+    }
 }
