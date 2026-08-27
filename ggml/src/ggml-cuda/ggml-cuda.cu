@@ -4045,6 +4045,8 @@ bool ggml_cuda_halo_try_epi(const ggml_cgraph * cgraph, int i, std::vector<const
 bool ggml_cuda_halo_try_moe(const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list);
 bool ggml_cuda_halo_try_addnorm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list);
 bool ggml_cuda_halo_try_moeblock(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list);
+bool ggml_cuda_halo_try_attnblock(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list);
+bool ggml_cuda_halo_try_attnglue(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list);
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
@@ -4228,6 +4230,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
                 if (ggml_cuda_halo_try_moeblock(*cuda_ctx, cgraph, i, halo_qkv_skip)) {
+                    continue;
+                }
+                if (ggml_cuda_halo_try_attnblock(*cuda_ctx, cgraph, i, halo_qkv_skip)) {
+                    continue;
+                }
+                if (ggml_cuda_halo_try_attnglue(*cuda_ctx, cgraph, i, halo_qkv_skip)) {
                     continue;
                 }
                 if (ggml_cuda_halo_try_qkv(*cuda_ctx, cgraph, i, halo_qkv_skip)) {
