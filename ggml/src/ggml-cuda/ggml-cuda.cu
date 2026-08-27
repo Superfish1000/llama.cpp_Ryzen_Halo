@@ -4044,6 +4044,7 @@ void ggml_cuda_halo_norm_clear();
 bool ggml_cuda_halo_try_epi(const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list);
 bool ggml_cuda_halo_try_moe(const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list);
 bool ggml_cuda_halo_try_addnorm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list);
+bool ggml_cuda_halo_try_moeblock(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, std::vector<const ggml_tensor *> & skip_list);
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
@@ -4145,6 +4146,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             std::vector<const ggml_tensor *> halo_qkv_skip;
             ggml_cuda_halo_norm_clear();
+            {
+                static bool dumped = false;
+                if (!dumped && getenv("HALO_DUMP_REGION") != nullptr && cgraph->n_nodes > 40) {
+                    dumped = true;
+                    const int lim = cgraph->n_nodes < 100 ? cgraph->n_nodes : 100;
+                    for (int di = 0; di < lim; ++di) {
+                        const ggml_tensor * n = cgraph->nodes[di];
+                        fprintf(stderr, "halo-dump %3d %-14s %-24s t=%-6s ne=[%lld,%lld,%lld] srcs=",
+                                di, ggml_op_name(n->op), n->name, ggml_type_name(n->type),
+                                (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2]);
+                        for (int si = 0; si < GGML_MAX_SRC && n->src[si]; ++si) {
+                            fprintf(stderr, "%s%s", si ? "," : "", n->src[si]->name);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4208,6 +4226,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         }
                         continue;
                     }
+                }
+                if (ggml_cuda_halo_try_moeblock(*cuda_ctx, cgraph, i, halo_qkv_skip)) {
+                    continue;
                 }
                 if (ggml_cuda_halo_try_qkv(*cuda_ctx, cgraph, i, halo_qkv_skip)) {
                     continue;
