@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "server-schema.h"
 
 #include "json-schema-to-grammar.h"
@@ -493,8 +494,11 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
                 ctx.params.antiprompt.push_back(stop.get<std::string>());
             }
             // fall back to CLI defaults if the request provided no effective stop strings
-            if (ctx.params.antiprompt.empty()) {
-                ctx.params.antiprompt = params_base.antiprompt;
+            // server-wide stop strings (-r / --reverse-prompt) always apply, on top of the request's own
+            for (const auto & word : params_base.antiprompt) {
+                if (std::find(ctx.params.antiprompt.begin(), ctx.params.antiprompt.end(), word) == ctx.params.antiprompt.end()) {
+                    ctx.params.antiprompt.push_back(word);
+                }
             }
         }));
 
