@@ -4784,11 +4784,11 @@ void server_routes::init_routes() {
             json props = get_res_props(*meta, params, false);
             // pinned shared prefix: atomics only, safe from this thread
             props["prefix_pin"] = json {
-                { "enabled",  pin_seq >= 0 },
-                { "seq",      pin_seq },
-                { "n_tokens", pin_n_tokens.load() },
-                { "hits",     pin_hits.load() },
-                { "shrinks",  pin_shrinks.load() },
+                { "enabled",  ctx_server.pin_seq >= 0 },
+                { "seq",      ctx_server.pin_seq },
+                { "n_tokens", ctx_server.pin_n_tokens.load() },
+                { "hits",     ctx_server.pin_hits.load() },
+                { "shrinks",  ctx_server.pin_shrinks.load() },
                 { "min",      params.prefix_pin_min },
             };
             res->ok(props);
