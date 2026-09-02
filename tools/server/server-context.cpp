@@ -1,3 +1,4 @@
+#include <atomic>
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -842,8 +843,9 @@ private:
     // prompt, then shrunk to the common prefix as other requests arrive.
     llama_seq_id  pin_seq     = -1;
     server_tokens pin_tokens;
-    int64_t       pin_hits    = 0;
-    int64_t       pin_shrinks = 0;
+    std::atomic<int64_t> pin_n_tokens{0};   // mirrors pin_tokens.size() for /props
+    std::atomic<int64_t> pin_hits{0};
+    std::atomic<int64_t> pin_shrinks{0};
 
     server_batch batch;
 
@@ -1504,6 +1506,7 @@ private:
         llama_tokens toks = slot.prompt.tokens.get_text_tokens();
         toks.resize(n_prompt);
         pin_tokens = server_tokens(toks, false);
+        pin_n_tokens = n_prompt;
         SLT_INF(slot, "prefix-pin: captured %d tokens into seq %d\n", n_prompt, pin_seq);
     }
 
@@ -3357,6 +3360,7 @@ private:
                                     ok = llama_memory_seq_rm(mem, slot.id, p_div, -1);
                                     if (ok && llama_memory_seq_rm(mem, pin_seq, p_div, -1)) {
                                         pin_tokens.keep_first(lcp_pin);
+                                        pin_n_tokens = lcp_pin;
                                         pin_shrinks++;
                                         SLT_INF(slot, "prefix-pin: shrunk pin %d -> %d tokens\n", n_pin, lcp_pin);
                                     }
@@ -3368,7 +3372,7 @@ private:
                                     slot.prompt.checkpoints.clear();
                                     n_past = lcp_pin;
                                     pin_hits++;
-                                    SLT_INF(slot, "prefix-pin: aliased %d of %d pinned tokens (seq %d -> %d), hits = %" PRId64 "\n", lcp_pin, n_pin, pin_seq, slot.id, pin_hits);
+                                    SLT_INF(slot, "prefix-pin: aliased %d of %d pinned tokens (seq %d -> %d), hits = %" PRId64 "\n", lcp_pin, n_pin, pin_seq, slot.id, pin_hits.load());
                                 } else {
                                     // partial seq_rm unsupported: fall back to a clean full prefill
                                     llama_memory_seq_rm(mem, slot.id, -1, -1);
@@ -4777,7 +4781,17 @@ void server_routes::init_routes() {
             std::unique_lock<std::mutex> lock(mutex_cache);
             res->ok(cached_props);
         } else {
-            res->ok(get_res_props(*meta, params, false));
+            json props = get_res_props(*meta, params, false);
+            // pinned shared prefix: atomics only, safe from this thread
+            props["prefix_pin"] = json {
+                { "enabled",  pin_seq >= 0 },
+                { "seq",      pin_seq },
+                { "n_tokens", pin_n_tokens.load() },
+                { "hits",     pin_hits.load() },
+                { "shrinks",  pin_shrinks.load() },
+                { "min",      params.prefix_pin_min },
+            };
+            res->ok(props);
         }
         return res;
     };
