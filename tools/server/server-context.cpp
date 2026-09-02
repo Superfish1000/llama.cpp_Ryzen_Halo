@@ -835,6 +835,16 @@ private:
 
     llama_context * ctx_tgt = nullptr;
 
+    // pinned shared prefix. a reserved sequence (id = n_parallel) holds the KV of a prompt
+    // prefix common to many requests; slots alias it via seq_cp -- zero-copy in the unified
+    // cache -- and diverge copy-on-write. prefilled once per model load, never cleared by
+    // --cache-idle-slots. discovered from traffic: captured whole from the first sizeable
+    // prompt, then shrunk to the common prefix as other requests arrive.
+    llama_seq_id  pin_seq     = -1;
+    server_tokens pin_tokens;
+    int64_t       pin_hits    = 0;
+    int64_t       pin_shrinks = 0;
+
     server_batch batch;
 
     llama_model   * model_dft = nullptr;
@@ -1176,6 +1186,16 @@ private:
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot, params_base.kv_unified ? "true" : "false");
 
+        if (params_base.prefix_pin) {
+            if (!params_base.kv_unified) {
+                SRV_WRN("%s", "prefix-pin requires --kv-unified (seq_cp is only zero-copy in the unified cache), disabling\n");
+                params_base.prefix_pin = false;
+            } else {
+                pin_seq = params_base.n_parallel;   // n_seq_max was sized n_parallel + 1 for this
+                SRV_INF("prefix-pin enabled: reserved seq %d, min prefix %d tokens\n", pin_seq, params_base.prefix_pin_min);
+            }
+        }
+
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
@@ -1226,6 +1246,8 @@ private:
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
                 }
+                // the slot's KV still holds this prompt here; capture it as the pin if we have none
+                pin_maybe_capture(slot);
             };
 
             slot.reset();
@@ -1449,6 +1471,40 @@ private:
         }
 
         return nullptr;
+    }
+
+    // capture the first sizeable completion prompt as the pinned prefix. pinning the whole
+    // prompt is the right starting point: later requests shrink it to the true common prefix.
+    void pin_maybe_capture(const server_slot & slot) {
+        if (pin_seq < 0 || !pin_tokens.empty()) {
+            return;
+        }
+        if (!slot.task || slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.task->is_child()) {
+            return;
+        }
+        if (slot.prompt.tokens.has_mtmd) {
+            return;
+        }
+        const int n_prompt = slot.task->n_tokens();
+        if (n_prompt < params_base.prefix_pin_min || (int) slot.prompt.tokens.size() < n_prompt) {
+            return;
+        }
+        auto * mem = llama_get_memory(ctx_tgt);
+        llama_memory_seq_rm(mem, pin_seq, -1, -1);
+        llama_memory_seq_cp(mem, slot.id, pin_seq, -1, -1);
+        // the slot also holds tokens it generated past the prompt; the pin keeps only the prompt
+        if ((int) slot.prompt.tokens.size() > n_prompt) {
+            if (!llama_memory_seq_rm(mem, pin_seq, slot.prompt.tokens.pos_next(n_prompt), -1)) {
+                // partial removal unsupported (sliding-window / recurrent memory): cannot trim, so do not pin
+                llama_memory_seq_rm(mem, pin_seq, -1, -1);
+                SLT_WRN(slot, "%s", "prefix-pin: this model does not support partial seq_rm, not pinning\n");
+                return;
+            }
+        }
+        llama_tokens toks = slot.prompt.tokens.get_text_tokens();
+        toks.resize(n_prompt);
+        pin_tokens = server_tokens(toks, false);
+        SLT_INF(slot, "prefix-pin: captured %d tokens into seq %d\n", n_prompt, pin_seq);
     }
 
     server_slot * get_available_slot(const server_task & task) {
@@ -3279,6 +3335,47 @@ private:
                                     } else {
                                         ++it;
                                     }
+                                }
+                            }
+                        }
+
+                        // prefix-pin: if the pinned prefix covers more of this prompt than the slot's own
+                        // cache does, alias it in (zero-copy) and continue from its end. a host-cache
+                        // restore of a longer conversation has already set n_past higher and wins here.
+                        if (pin_seq >= 0 && !pin_tokens.empty() && !slot.task->tokens.has_mtmd) {
+                            const int lcp_pin = (int) pin_tokens.get_common_prefix(slot.task->tokens);
+                            if (lcp_pin >= params_base.prefix_pin_min && lcp_pin > n_past) {
+                                auto * mem = llama_get_memory(ctx_tgt);
+                                const int n_pin = (int) pin_tokens.size();
+                                bool ok = true;
+                                llama_memory_seq_rm(mem, slot.id, -1, -1);
+                                llama_memory_seq_cp(mem, pin_seq, slot.id, -1, -1);
+                                if (lcp_pin < n_pin) {
+                                    // the request diverges inside the pin: drop the tail from the slot's
+                                    // view, and shrink the pin so it converges on the true common prefix
+                                    const llama_pos p_div = pin_tokens.pos_next(lcp_pin);
+                                    ok = llama_memory_seq_rm(mem, slot.id, p_div, -1);
+                                    if (ok && llama_memory_seq_rm(mem, pin_seq, p_div, -1)) {
+                                        pin_tokens.keep_first(lcp_pin);
+                                        pin_shrinks++;
+                                        SLT_INF(slot, "prefix-pin: shrunk pin %d -> %d tokens\n", n_pin, lcp_pin);
+                                    }
+                                }
+                                if (ok) {
+                                    llama_tokens toks = pin_tokens.get_text_tokens();
+                                    toks.resize(lcp_pin);
+                                    slot.prompt.tokens = server_tokens(toks, false);
+                                    slot.prompt.checkpoints.clear();
+                                    n_past = lcp_pin;
+                                    pin_hits++;
+                                    SLT_INF(slot, "prefix-pin: aliased %d of %d pinned tokens (seq %d -> %d), hits = %" PRId64 "\n", lcp_pin, n_pin, pin_seq, slot.id, pin_hits);
+                                } else {
+                                    // partial seq_rm unsupported: fall back to a clean full prefill
+                                    llama_memory_seq_rm(mem, slot.id, -1, -1);
+                                    slot.prompt.tokens = server_tokens(llama_tokens{}, false);
+                                    slot.prompt.checkpoints.clear();
+                                    n_past = 0;
+                                    SLT_WRN(slot, "%s", "prefix-pin: partial seq_rm unsupported, full prefill instead\n");
                                 }
                             }
                         }

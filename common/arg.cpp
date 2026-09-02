@@ -1726,6 +1726,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefix-pin"},
+        {"--no-prefix-pin"},
+        "pin a shared prompt prefix (e.g. an agent system prompt) in a reserved KV sequence and alias it into slots zero-copy instead of re-prefilling it per slot; the pin is discovered from traffic and shrinks to the common prefix (default: disabled, requires --kv-unified)",
+        [](common_params & params, bool value) {
+            params.prefix_pin = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_PIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefix-pin-min"}, "N",
+        string_format("minimum prefix length in tokens to pin or alias (default: %d)", params.prefix_pin_min),
+        [](common_params & params, int value) {
+            params.prefix_pin_min = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_PIN_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),
