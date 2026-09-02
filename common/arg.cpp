@@ -1748,6 +1748,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PREFIX_PIN_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefix-pin-max"}, "N",
+        string_format("capture at most N tokens of a prompt into a pin, so a one-off long conversation cannot hold KV for its whole length (default: %d, 0 = whole prompt)", params.prefix_pin_max),
+        [](common_params & params, int value) {
+            params.prefix_pin_max = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_PREFIX_PIN_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

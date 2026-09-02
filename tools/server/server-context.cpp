@@ -812,11 +812,15 @@ public:
             });
         }
         return json {
-            { "enabled", !pins.empty() },
-            { "count",   (int) pins.size() },
-            { "min",     params_base.prefix_pin_min },
-            { "hits",    hits },
-            { "pins",    arr },
+            { "enabled",      !pins.empty() },
+            { "count",        (int) pins.size() },
+            { "min",          params_base.prefix_pin_min },
+            { "max",          params_base.prefix_pin_max },
+            { "hits",         pin_hits_total.load() },   // all aliases ever, across replaced pins
+            { "hits_current", hits },                    // sum over the pins present now
+            { "captures",     pin_captures.load() },
+            { "replacements", pin_replacements.load() },
+            { "pins",         arr },
         };
     }
 
@@ -875,6 +879,9 @@ private:
         std::atomic<int64_t> shrinks{0};
     };
     std::vector<std::unique_ptr<prefix_pin>> pins;   // sized once at load, never resized
+    std::atomic<int64_t> pin_hits_total{0};          // unlike a pin's own counter, survives replacement
+    std::atomic<int64_t> pin_captures{0};
+    std::atomic<int64_t> pin_replacements{0};
 
     // the pin with the longest common prefix with tokens, if it clears the minimum
     prefix_pin * pin_best(const server_tokens & tokens, int & lcp_out) {
@@ -1239,6 +1246,11 @@ private:
             if (!params_base.kv_unified) {
                 SRV_WRN("%s", "prefix-pin requires --kv-unified (seq_cp is only zero-copy in the unified cache), disabling\n");
                 params_base.n_prefix_pins = 0;
+            } else if (params_base.ctx_shift || params_base.n_cache_reuse > 0) {
+                // both re-position KV cells in place (seq_add / seq_div); a cell shared with a pin would
+                // move for every sequence that shares it
+                SRV_WRN("%s", "prefix-pin cannot be combined with --context-shift or --cache-reuse, disabling\n");
+                params_base.n_prefix_pins = 0;
             } else {
                 for (int i = 0; i < params_base.n_prefix_pins; ++i) {
                     auto p = std::make_unique<prefix_pin>();
@@ -1540,6 +1552,9 @@ private:
         if (slot.prompt.tokens.has_mtmd) {
             return;
         }
+        if (slot.stop == STOP_TYPE_NONE) {
+            return;   // released by an error or an abort: the KV need not hold the whole prompt
+        }
         const int n_prompt = slot.task->n_tokens();
         if (n_prompt < params_base.prefix_pin_min || (int) slot.prompt.tokens.size() < n_prompt) {
             return;
@@ -1557,8 +1572,18 @@ private:
         }
         const bool replaced = dst == nullptr;
         if (replaced) {
+            // victim: a pin nobody has aliased yet before one that is being hit, then the least recently hit.
+            // a burst of one-off prompts must not evict the family the server is actually serving
+            auto better_victim = [](const prefix_pin & a, const prefix_pin & b) {
+                const bool a_unused = a.hits.load() == 0;
+                const bool b_unused = b.hits.load() == 0;
+                if (a_unused != b_unused) {
+                    return a_unused;
+                }
+                return a.t_last_hit < b.t_last_hit;
+            };
             for (auto & p : pins) {
-                if (dst == nullptr || p->t_last_hit < dst->t_last_hit) {
+                if (dst == nullptr || better_victim(*p, *dst)) {
                     dst = p.get();
                 }
             }
@@ -1566,9 +1591,11 @@ private:
         auto * mem = llama_get_memory(ctx_tgt);
         llama_memory_seq_rm(mem, dst->seq, -1, -1);
         llama_memory_seq_cp(mem, slot.id, dst->seq, -1, -1);
-        // the slot also holds tokens it generated past the prompt; the pin keeps only the prompt
-        if ((int) slot.prompt.tokens.size() > n_prompt) {
-            if (!llama_memory_seq_rm(mem, dst->seq, slot.prompt.tokens.pos_next(n_prompt), -1)) {
+        // the slot also holds tokens it generated past the prompt; the pin keeps only the prompt,
+        // and at most --prefix-pin-max of it
+        const int n_keep = params_base.prefix_pin_max > 0 ? std::min(n_prompt, params_base.prefix_pin_max) : n_prompt;
+        if ((int) slot.prompt.tokens.size() > n_keep) {
+            if (!llama_memory_seq_rm(mem, dst->seq, slot.prompt.tokens.pos_next(n_keep), -1)) {
                 llama_memory_seq_rm(mem, dst->seq, -1, -1);
                 dst->tokens = server_tokens(llama_tokens{}, false);
                 dst->n_tokens = 0;
@@ -1577,13 +1604,17 @@ private:
             }
         }
         llama_tokens toks = slot.prompt.tokens.get_text_tokens();
-        toks.resize(n_prompt);
+        toks.resize(n_keep);
         dst->tokens = server_tokens(toks, false);
-        dst->n_tokens = n_prompt;
+        dst->n_tokens = n_keep;
+        pin_captures++;
+        if (replaced) {
+            pin_replacements++;
+        }
         dst->t_last_hit = ggml_time_us();
         dst->hits = 0;
         dst->shrinks = 0;
-        SLT_INF(slot, "prefix-pin: captured %d tokens into seq %d%s\n", n_prompt, dst->seq, replaced ? " (replaced the least recently used pin)" : "");
+        SLT_INF(slot, "prefix-pin: captured %d of %d prompt tokens into seq %d%s\n", n_keep, n_prompt, dst->seq, replaced ? " (replaced a pin)" : "");
     }
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
@@ -3458,6 +3489,7 @@ private:
                                     slot.prompt.checkpoints.clear();
                                     n_past = lcp_pin;
                                     pin->hits++;
+                                    pin_hits_total++;
                                     pin->t_last_hit = ggml_time_us();
                                     SLT_INF(slot, "prefix-pin: aliased %d of %d tokens (seq %d -> %d), hits = %" PRId64 "\n", lcp_pin, n_pin, pin->seq, slot.id, pin->hits.load());
                                 } else {
