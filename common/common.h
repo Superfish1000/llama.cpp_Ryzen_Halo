@@ -614,6 +614,7 @@ struct common_params {
     int32_t n_prefix_pins       = 0;     // pinned shared prompt prefixes, one reserved KV sequence each; slots alias them zero-copy
     int32_t prefix_pin_min      = 512;   // do not pin or alias prefixes shorter than this many tokens
     int32_t prefix_pin_max      = 0;     // capture at most this many tokens into a pin (0 = whole prompt)
+    int32_t n_prefill_shared    = 0;     // while a slot generates, add at most this many prompt tokens per batch (0 = n_batch)
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.

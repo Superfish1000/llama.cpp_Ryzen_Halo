@@ -1755,6 +1755,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PREFIX_PIN_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefill-shared"}, "N",
+        string_format("while any slot is generating, add at most N prompt tokens to a batch, so generating slots get a token per decode step instead of one per --batch-size of someone else's prompt (default: %d, 0 = no cap)", params.n_prefill_shared),
+        [](common_params & params, int value) {
+            params.n_prefill_shared = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_PREFILL_SHARED").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

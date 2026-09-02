@@ -3163,6 +3163,14 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        // --prefill-shared: the batch already holds one token per generating slot, and each of
+        // them gets exactly one token out of this whole batch. Cap the prompt tokens added on
+        // top so a long prefill cannot stall everyone else to one token per n_batch.
+        const int32_t n_batch_gen = (int32_t) batch.size();
+        if (params_base.n_prefill_shared > 0 && n_batch_gen > 0) {
+            n_batch = std::min(n_batch, n_batch_gen + params_base.n_prefill_shared);
+        }
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
