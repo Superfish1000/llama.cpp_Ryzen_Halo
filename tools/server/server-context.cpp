@@ -1759,7 +1759,16 @@ private:
             }
 
             if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+                // the pool is full and this idle conversation has to go. keep a copy in the host prompt
+                // cache when there is one, exactly as a task launch does, so its next turn restores
+                // instead of prefilling from zero. purging without saving cost a user a 100K-token
+                // conversation whenever someone else's long prompt filled the pool.
+                if (params_base.cache_idle_slots && prompt_cache && slot.prompt_save(*prompt_cache)) {
+                    prompt_cache->update();
+                    SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+                } else {
+                    SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+                }
 
                 slot.prompt_clear();
 
