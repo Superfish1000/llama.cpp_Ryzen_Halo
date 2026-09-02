@@ -631,6 +631,10 @@ struct server_prompt_cache {
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
+    // longest common prefix any stored state offers tokens_new, by load()'s own acceptance
+    // rule. a query only: nothing is restored or consumed.
+    size_t best_lcp(const server_tokens & tokens_new) const;
+
     void update();
 };
 

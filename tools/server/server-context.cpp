@@ -1625,7 +1625,17 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                // pin-first. a prefix the pin covers is aliased for free by the prompt-processing
+                // path (a cell-metadata update), so do not pay a 2 GB state restore for the same
+                // tokens -- that restore also consumes the cache entry. the host cache still wins
+                // when one of its entries covers strictly more of this prompt, e.g. a whole
+                // prior conversation of this user.
+                const int lcp_pin = (pin_seq >= 0 && !pin_tokens.empty() && !task.tokens.has_mtmd)
+                    ? (int) pin_tokens.get_common_prefix(task.tokens) : 0;
+                if (lcp_pin >= params_base.prefix_pin_min && lcp_pin >= (int) prompt_cache->best_lcp(task.tokens)) {
+                    SLT_INF(*ret, "prefix-pin: covers %d tokens, skipping host-cache restore\n", lcp_pin);
+                    ret->prompt_clear();
+                } else if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
 

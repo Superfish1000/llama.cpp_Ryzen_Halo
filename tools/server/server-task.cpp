@@ -1790,6 +1790,25 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
+size_t server_prompt_cache::best_lcp(const server_tokens & tokens_new) const {
+    size_t best = 0;
+    for (const auto & st : states) {
+        const size_t n = st.prompt.tokens.size();
+        if (n == 0) {
+            continue;
+        }
+        const size_t lcp = st.prompt.tokens.get_common_prefix(tokens_new);
+        // load() refuses to trash a large prompt for a poor match; mirror that
+        if (float(lcp) / n < 0.25f) {
+            continue;
+        }
+        if (lcp > best) {
+            best = lcp;
+        }
+    }
+    return best;
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
