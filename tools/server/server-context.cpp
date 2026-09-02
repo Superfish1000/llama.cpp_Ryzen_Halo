@@ -797,6 +797,19 @@ public:
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
+    // read-only view of the pinned prefix for /props. atomics only, so it is safe from the
+    // HTTP thread and while the llama context is asleep.
+    json pin_status() const {
+        return json {
+            { "enabled",  pin_seq >= 0 },
+            { "seq",      pin_seq },
+            { "n_tokens", pin_n_tokens.load() },
+            { "hits",     pin_hits.load() },
+            { "shrinks",  pin_shrinks.load() },
+            { "min",      params_base.prefix_pin_min },
+        };
+    }
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -4783,14 +4796,7 @@ void server_routes::init_routes() {
         } else {
             json props = get_res_props(*meta, params, false);
             // pinned shared prefix: atomics only, safe from this thread
-            props["prefix_pin"] = json {
-                { "enabled",  ctx_server.pin_seq >= 0 },
-                { "seq",      ctx_server.pin_seq },
-                { "n_tokens", ctx_server.pin_n_tokens.load() },
-                { "hits",     ctx_server.pin_hits.load() },
-                { "shrinks",  ctx_server.pin_shrinks.load() },
-                { "min",      params.prefix_pin_min },
-            };
+            props["prefix_pin"] = ctx_server.pin_status();
             res->ok(props);
         }
         return res;
