@@ -1728,11 +1728,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--prefix-pin"},
         {"--no-prefix-pin"},
-        "pin a shared prompt prefix (e.g. an agent system prompt) in a reserved KV sequence and alias it into slots zero-copy instead of re-prefilling it per slot; the pin is discovered from traffic and shrinks to the common prefix (default: disabled, requires --kv-unified)",
+        "pin one shared prompt prefix (same as --prefix-pins 1); see --prefix-pins",
         [](common_params & params, bool value) {
-            params.prefix_pin = value;
+            params.n_prefix_pins = value ? std::max(1, params.n_prefix_pins) : 0;
         }
     ).set_env("LLAMA_ARG_PREFIX_PIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefix-pins"}, "N",
+        string_format("keep N shared prompt prefixes pinned in reserved KV sequences, one per prompt family (e.g. per agent fleet), and alias them into slots zero-copy instead of re-prefilling per slot. discovered from traffic: an uncovered prompt takes a free pin or replaces the least recently used one, and each pin shrinks to its family's common prefix. each pin holds its prefix's KV permanently. (default: %d, requires --kv-unified)", params.n_prefix_pins),
+        [](common_params & params, int value) {
+            params.n_prefix_pins = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_PREFIX_PINS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--prefix-pin-min"}, "N",
         string_format("minimum prefix length in tokens to pin or alias (default: %d)", params.prefix_pin_min),

@@ -611,7 +611,7 @@ struct common_params {
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
-    bool    prefix_pin          = false; // pin a shared prompt prefix in a reserved KV sequence; slots alias it zero-copy
+    int32_t n_prefix_pins       = 0;     // pinned shared prompt prefixes, one reserved KV sequence each; slots alias them zero-copy
     int32_t prefix_pin_min      = 512;   // do not pin or alias prefixes shorter than this many tokens
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints

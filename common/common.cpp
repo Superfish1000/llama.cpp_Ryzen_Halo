@@ -1720,13 +1720,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     // the pinned prefix lives in one extra sequence beyond the slots
-    cparams.n_seq_max         = params.n_parallel + (params.prefix_pin ? 1 : 0);
+    cparams.n_seq_max         = params.n_parallel + std::max(0, params.n_prefix_pins);
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     // llama_context asserts n_outputs_max >= n_seq_max. n_seq_max grew by one above for the
     // pinned prefix sequence, so when the caller budgets outputs explicitly (the server passes
     // n_parallel), grow that too. 0 means n_batch, which already has room.
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0)
-                              + ((params.prefix_pin && params.n_outputs_max > 0) ? 1 : 0);
+                              + (params.n_outputs_max > 0 ? std::max(0, params.n_prefix_pins) : 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
