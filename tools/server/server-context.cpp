@@ -1474,6 +1474,9 @@ private:
             handle_sleeping_state(sleeping);
         });
 
+        // parking a quiet slot only works if the loop still turns while nothing is queued
+        queue_tasks.set_tick_when_idle(params_base.cache_idle_secs > 0);
+
         metrics.init();
 
         if (params_base.cache_idle_slots) {

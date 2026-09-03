@@ -357,6 +357,9 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 if (res) {
                     break; // new task arrived or terminate
                 }
+                if (tick_when_idle) {
+                    break; // nothing to do, but let update_slots() run its idle-time work
+                }
                 // otherwise, loop again to check sleeping condition
             }
         }

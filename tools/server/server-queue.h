@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "server-task.h"
 
 #include <condition_variable>
@@ -45,6 +47,10 @@ private:
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
+
+    // when set, an idle wait that times out returns to callback_update_slots() instead of
+    // waiting again, so periodic work still happens while no tasks are queued
+    std::atomic<bool> tick_when_idle{false};
 
 public:
     ~server_queue() { worker_stop(); }
@@ -132,6 +138,10 @@ public:
     // entering sleep: queue.sleeping = true --> cb0(true) --> cb1(true) --> cb2(true)
     // leaving sleep: cb2(false) --> cb1(false) --> cb0(false) --> queue.sleeping = false
     // note: caller will hold mutex_tasks while calling the callbacks
+    // let an idle wait return to the update callback instead of waiting again, so periodic
+    // work still runs when no tasks are queued
+    void set_tick_when_idle(bool v) { tick_when_idle = v; }
+
     void on_sleeping_state(std::function<void(bool)> callback) {
         callback_sleeping_state.push_back(std::move(callback));
     }
