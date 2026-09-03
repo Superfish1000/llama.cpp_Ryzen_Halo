@@ -1416,7 +1416,9 @@ private:
 
                 if (params_base.prefix_cache) {
                     for (auto * st : prompt_cache->get_shared_all()) {
-                        prefix_families.push_back(st->prompt.tokens.clone());
+                        prefix_family fam_new;
+                        fam_new.tokens = st->prompt.tokens.clone();
+                        prefix_families.push_back(std::move(fam_new));
                     }
 
                     SRV_INF("prefix cache: enabled, %d held prefix(es) adopted from disk\n",
@@ -1929,15 +1931,24 @@ private:
     // the prompt prefixes this server's callers share: an agent's system prompt and tool
     // schema. one family per caller, learned from traffic and refined downward, each held in
     // the prompt cache as an entry of its own, so memory looks like P1+C1, P1+C2, P2+C3.
-    std::vector<server_tokens> prefix_families;
+    struct prefix_family {
+        server_tokens tokens;        // the agreed prefix, as confirmed so far
+
+        // a shorter agreement point seen but not yet acted on. one unusual prompt should move
+        // the target without costing the copy we already hold
+        size_t pending_len = 0;
+        int    pending_n   = 0;
+    };
+
+    std::vector<prefix_family> prefix_families;
 
     // the family this prompt belongs to, or nullptr if it belongs to none of them
-    server_tokens * prefix_family_for(const server_tokens & tokens) {
-        server_tokens * best = nullptr;
+    prefix_family * prefix_family_for(const server_tokens & tokens) {
+        prefix_family * best = nullptr;
         size_t best_lcp = 0;
 
         for (auto & fam : prefix_families) {
-            const size_t lcp = fam.get_common_prefix(tokens);
+            const size_t lcp = fam.tokens.get_common_prefix(tokens);
             if (lcp >= (size_t) params_base.prefix_cache_min && lcp > best_lcp) {
                 best_lcp = lcp;
                 best     = &fam;
@@ -1947,8 +1958,8 @@ private:
         return best;
     }
 
-    bool prefix_held(const server_tokens & fam) {
-        return prompt_cache && prompt_cache->get_shared(fam) != nullptr;
+    bool prefix_held(const server_tokens & toks) {
+        return prompt_cache && prompt_cache->get_shared(toks) != nullptr;
     }
 
     void prefix_learn(const server_tokens & tokens) {
@@ -1973,29 +1984,57 @@ private:
 
             llama_tokens toks = tokens.get_text_tokens();
             toks.resize(std::min<size_t>(toks.size(), (size_t) n_max));
-            prefix_families.push_back(server_tokens(toks, false));
+
+            prefix_family fam_new;
+            fam_new.tokens = server_tokens(toks, false);
+            prefix_families.push_back(std::move(fam_new));
 
             SRV_INF("prefix cache: new prefix family of %d tokens (%d held)\n",
                     (int) toks.size(), (int) prefix_families.size());
             return;
         }
 
-        const int lcp = (int) fam->get_common_prefix(tokens);
+        const size_t lcp = fam->tokens.get_common_prefix(tokens);
 
-        if (lcp < (int) fam->size()) {
-            // this family is narrower than we thought. the entry we hold no longer matches it,
-            // so let it become an ordinary entry and age out, and capture the shorter prefix
-            if (prompt_cache) {
-                auto * cur = prompt_cache->get_shared(*fam);
-                if (cur) {
-                    cur->shared = false;
-                }
-            }
-
-            fam->keep_first(lcp);
-
-            SRV_INF("prefix cache: refined a prefix family to %d tokens\n", lcp);
+        if (lcp >= fam->tokens.size()) {
+            // this prompt agrees with all of it
+            fam->pending_len = 0;
+            fam->pending_n   = 0;
+            return;
         }
+
+        // a shorter agreement point. wait for a second prompt to say the same before giving up
+        // what we hold: one unusual prompt should not cost everyone the prefix
+        if (fam->pending_len == lcp) {
+            fam->pending_n++;
+        } else {
+            fam->pending_len = lcp;
+            fam->pending_n   = 1;
+
+            SRV_INF("prefix cache: a prompt agrees to only %d of %d tokens, waiting for a second\n",
+                    (int) lcp, (int) fam->tokens.size());
+            return;
+        }
+
+        if (fam->pending_n < 2) {
+            return;
+        }
+
+        // confirmed: shave the family and let what we hold age out, so the next prefill
+        // through the new boundary captures it
+        if (prompt_cache) {
+            auto * cur = prompt_cache->get_shared(fam->tokens);
+            if (cur) {
+                cur->shared = false;
+            }
+        }
+
+        SRV_INF("prefix cache: shaved a prefix family from %d to %d tokens (confirmed twice)\n",
+                (int) fam->tokens.size(), (int) lcp);
+
+        fam->tokens.keep_first(lcp);
+        fam->pending_len = 0;
+        fam->pending_n   = 0;
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
@@ -2008,11 +2047,22 @@ private:
 
             if (params_base.prefix_cache) {
                 auto * fam = prefix_family_for(task.tokens);
-                if (fam != nullptr && !prefix_held(*fam)) {
-                    const int n_pfx = (int) fam->size();
-                    if ((int) fam->get_common_prefix(task.tokens) == n_pfx &&
-                        (int) slot.prompt.tokens.get_common_prefix(task.tokens) < n_pfx) {
+
+                if (fam == nullptr) {
+                    SLT_INF(slot, "%s", "prefix cache: no family matches this prompt, not capturing\n");
+                } else if (prefix_held(fam->tokens)) {
+                    // nothing to do: the prefix is already held and will be restored below
+                } else {
+                    const int n_pfx  = (int) fam->tokens.size();
+                    const int n_fam  = (int) fam->tokens.get_common_prefix(task.tokens);
+                    const int n_slot = (int) slot.prompt.tokens.get_common_prefix(task.tokens);
+
+                    if (n_fam == n_pfx && n_slot < n_pfx) {
                         slot.capture_prefix_at = n_pfx;
+                        SLT_INF(slot, "prefix cache: will capture %d tokens on this prefill\n", n_pfx);
+                    } else {
+                        SLT_INF(slot, "prefix cache: not capturing (family %d, prompt agrees %d, slot already has %d)\n",
+                                n_pfx, n_fam, n_slot);
                     }
                 }
             }
@@ -3100,29 +3150,6 @@ private:
         }
 #endif
 
-        // capture a prefix the moment a prefill has laid down exactly that many tokens
-        if (params_base.prefix_cache && prompt_cache) {
-            for (auto & slot : slots) {
-                if (slot.capture_prefix_at <= 0 || (int) slot.prompt.n_tokens() != slot.capture_prefix_at) {
-                    continue;
-                }
-
-                const int n_pfx = slot.capture_prefix_at;
-                slot.capture_prefix_at = 0;
-
-                prompt_cache->mark_next_shared = true;
-                const bool ok = slot.prompt_save(*prompt_cache);
-                prompt_cache->mark_next_shared = false;
-
-                if (ok) {
-                    prompt_cache->flush_to_disk();
-                    SLT_INF(slot, "prefix cache: holding %d tokens as a shared prefix\n", n_pfx);
-                } else {
-                    SLT_WRN(slot, "prefix cache: could not hold the %d token prefix\n", n_pfx);
-                }
-            }
-        }
-
         // a conversation that simply goes quiet used to be durable nowhere: the cache only
         // took it when another task launched. park it here, keeping it in the slot as well.
         if (params_base.cache_idle_secs > 0 && prompt_cache) {
@@ -4146,6 +4173,31 @@ private:
         } else {
             // success, apply batch metrics
             metrics_post_decode(off, batch_view.n_tokens, has_output);
+
+            // a prefill that was told to stop on a prefix boundary has just had that batch
+            // decoded, so this slot's KV holds the prefix and nothing after it. capture here,
+            // while that is provably true, rather than a loop pass later.
+            if (params_base.prefix_cache && prompt_cache) {
+                for (auto & slot : slots) {
+                    if (slot.capture_prefix_at <= 0 || (int) slot.prompt.n_tokens() != slot.capture_prefix_at) {
+                        continue;
+                    }
+
+                    const int n_pfx = slot.capture_prefix_at;
+                    slot.capture_prefix_at = 0;
+
+                    prompt_cache->mark_next_shared = true;
+                    const bool ok = slot.prompt_save(*prompt_cache);
+                    prompt_cache->mark_next_shared = false;
+
+                    if (ok) {
+                        prompt_cache->flush_to_disk();
+                        SLT_INF(slot, "prefix cache: holding %d tokens as a shared prefix\n", n_pfx);
+                    } else {
+                        SLT_WRN(slot, "prefix cache: could not hold the %d token prefix\n", n_pfx);
+                    }
+                }
+            }
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
