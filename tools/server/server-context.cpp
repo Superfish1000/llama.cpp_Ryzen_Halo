@@ -2987,6 +2987,9 @@ private:
 
                 if (slot.prompt_save(*prompt_cache)) {
                     prompt_cache->update();
+                    // parking is for durability, so put it where the process cannot take it with it.
+                    // the server is idle by definition here, so the write costs nobody anything.
+                    prompt_cache->flush_to_disk();
                     SLT_INF(slot, "parked %d tokens to the prompt cache after %d s idle\n",
                             slot.prompt.n_tokens(), params_base.cache_idle_secs);
                 }
