@@ -598,6 +598,11 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // second tier: when this is non-empty the state bytes live in this file and data is
+    // empty. size() therefore keeps reporting only what the entry costs in RAM.
+    std::string file;
+    size_t      size_disk = 0;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -610,9 +615,19 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int32_t limit_disk_mib = 0, const std::string & dir = "") {
+        this->limit_size      = 1024ull*1024ull*(limit_size_mib  < 0 ? 0 : limit_size_mib);
+        this->limit_tokens    = limit_tokens;
+        this->limit_size_disk = 1024ull*1024ull*(limit_disk_mib  < 0 ? 0 : limit_disk_mib);
+        this->dir_disk        = dir;
+        this->disk_enabled    = limit_disk_mib != 0 && !dir.empty();
+    }
+
+    ~server_prompt_cache() {
+        // leaving gigabytes of state files behind would fill the disk over a few restarts
+        for (auto & st : states) {
+            unlink_state(st);
+        }
     }
 
     std::list<server_prompt_cache_state> states;
@@ -622,6 +637,12 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // disk tier: bytes, 0 = no limit; enabled only when a directory was given
+    size_t      limit_size_disk = 0;
+    std::string dir_disk;
+    bool        disk_enabled = false;
+    size_t      file_seq = 0;
 
     size_t size() const;
 
@@ -636,6 +657,20 @@ struct server_prompt_cache {
     size_t best_lcp(const server_tokens & tokens_new) const;
 
     void update();
+
+    // bytes this cache currently occupies on disk
+    size_t size_disk() const;
+
+    // RAM -> disk. the entry stays in the cache, its bytes move to a file
+    bool demote(server_prompt_cache_state & state);
+
+    // disk -> RAM, consuming the file. a promoted entry is about to be restored
+    bool promote(server_prompt_cache_state & state);
+
+    void unlink_state(server_prompt_cache_state & state);
+
+    // erase an entry and its file together
+    std::list<server_prompt_cache_state>::iterator drop(std::list<server_prompt_cache_state>::iterator it);
 };
 
 // used exclusively by router mode

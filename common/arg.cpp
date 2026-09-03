@@ -1710,6 +1710,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-disk"}, "N",
+        string_format("second prompt-cache tier on disk, in MiB: an entry that no longer fits in --cache-ram is written to --cache-disk-path instead of being dropped, and read back on a hit. On a unified-memory machine the RAM tier is the same physical memory as the KV pool, so pair a small --cache-ram with a large --cache-disk. (default: %d, -1 = no limit, 0 = disabled)", params.cache_disk_mib),
+        [](common_params & params, int value) {
+            params.cache_disk_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-path"}, "PATH",
+        "directory for the disk prompt-cache tier (default: the --slot-save-path directory)",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
