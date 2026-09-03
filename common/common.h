@@ -621,6 +621,7 @@ struct common_params {
     int32_t cache_disk_mib      = 0;     // second prompt-cache tier on disk: -1 = no limit, 0 = disable, N = MiB
     std::string cache_disk_path;         // where disk-tier entries are written (default: --slot-save-path)
     int32_t cache_disk_ttl_h    = 168;   // discard disk-tier entries older than this many hours (0 = never)
+    int32_t cache_idle_secs     = 300;   // park a slot to the prompt cache after this long idle (0 = off)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

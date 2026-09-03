@@ -1731,6 +1731,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_TTL").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-idle-secs"}, "N",
+        string_format("copy a slot into the prompt cache once it has been idle for N seconds. The slot keeps its conversation, so this only makes it durable; without it a quiet conversation reaches the cache only when another task launches or the server exits. (default: %d, 0 = disabled)", params.cache_idle_secs),
+        [](common_params & params, int value) {
+            params.cache_idle_secs = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_IDLE_SECS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

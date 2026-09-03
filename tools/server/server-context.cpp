@@ -221,6 +221,9 @@ struct server_slot {
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
+    // ggml_time_us() when this slot's prompt was last copied to the prompt cache
+    int64_t t_last_parked = -1;
+
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
     int32_t n_keep  = 0;
@@ -2956,6 +2959,36 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // a conversation that simply goes quiet used to be durable nowhere: the cache only
+        // took it when another task launched. park it here, keeping it in the slot as well.
+        if (params_base.cache_idle_secs > 0 && prompt_cache) {
+            const int64_t t_now = ggml_time_us();
+            const int64_t t_idle = (int64_t) params_base.cache_idle_secs * 1000000;
+
+            for (auto & slot : slots) {
+                if (slot.is_processing() || slot.prompt.n_tokens() == 0 || slot.t_last_used < 0) {
+                    continue;
+                }
+
+                // nothing has happened to it since it was last written out
+                if (slot.t_last_parked >= slot.t_last_used) {
+                    continue;
+                }
+
+                if (t_now - slot.t_last_used < t_idle) {
+                    continue;
+                }
+
+                slot.t_last_parked = t_now;
+
+                if (slot.prompt_save(*prompt_cache)) {
+                    prompt_cache->update();
+                    SLT_INF(slot, "parked %d tokens to the prompt cache after %d s idle\n",
+                            slot.prompt.n_tokens(), params_base.cache_idle_secs);
+                }
+            }
+        }
 
         // check if all slots are idle
         {
