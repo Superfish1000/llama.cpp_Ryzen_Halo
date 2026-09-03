@@ -679,6 +679,9 @@ struct server_prompt_cache {
     // adopt this model's files left by an earlier run; delete its stale ones
     void load_dir();
 
+    // move every RAM-resident entry to disk. RAM does not survive the process
+    size_t flush_to_disk();
+
     // erase an entry and its file together
     std::list<server_prompt_cache_state>::iterator drop(std::list<server_prompt_cache_state>::iterator it);
 };

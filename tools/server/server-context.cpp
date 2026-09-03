@@ -1778,6 +1778,31 @@ private:
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
+    // called once the task loop has stopped and before the context is freed: park every
+    // conversation still sitting in a slot, then put the whole cache on disk. without this a
+    // slot that simply went quiet was never written anywhere and the restart re-prefilled it.
+    void park_all_slots() {
+        if (!prompt_cache) {
+            return;
+        }
+
+        int n_parked = 0;
+
+        for (auto & slot : slots) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
+                continue;
+            }
+
+            if (slot.prompt_save(*prompt_cache)) {
+                n_parked++;
+            }
+        }
+
+        const size_t n_disk = prompt_cache->flush_to_disk();
+
+        SRV_INF("on exit: parked %d slot(s), %zu cache entries now on disk\n", n_parked, n_disk);
+    }
+
     bool try_clear_idle_slots() {
         bool res = false;
 
@@ -4314,6 +4339,9 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+
+    // the loop has stopped but the context is still alive: last chance to keep the KV
+    impl->park_all_slots();
 }
 
 void server_context::terminate() {

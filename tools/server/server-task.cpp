@@ -1825,6 +1825,30 @@ void server_prompt_cache::load_dir() {
     update();
 }
 
+size_t server_prompt_cache::flush_to_disk() {
+    if (!disk_enabled) {
+        return 0;
+    }
+
+    size_t n = 0;
+
+    for (auto & state : states) {
+        if (state.file.empty() && !state.data.main.empty() && demote(state)) {
+            n++;
+        }
+    }
+
+    if (n > 0) {
+        SRV_INF("prompt cache: wrote %zu entries to disk (%.3f MiB total on disk)\n",
+                n, size_disk() / (1024.0 * 1024.0));
+    }
+
+    // honour the disk limit even on the way out
+    update();
+
+    return n;
+}
+
 void server_prompt_cache::unlink_state(server_prompt_cache_state & state) {
     if (!state.file.empty()) {
         std::remove(state.file.c_str());
