@@ -620,6 +620,7 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t cache_disk_mib      = 0;     // second prompt-cache tier on disk: -1 = no limit, 0 = disable, N = MiB
     std::string cache_disk_path;         // where disk-tier entries are written (default: --slot-save-path)
+    int32_t cache_disk_ttl_h    = 168;   // discard disk-tier entries older than this many hours (0 = never)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

@@ -616,8 +616,10 @@ struct server_prompt_cache_state {
 
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int32_t limit_disk_mib = 0,
-                        const std::string & dir = "", const std::string & fingerprint = "") {
+                        const std::string & dir = "", const std::string & fingerprint = "",
+                        int32_t ttl_hours = 0) {
         this->fingerprint = fingerprint;
+        this->ttl_hours   = ttl_hours;
         this->limit_size      = 1024ull*1024ull*(limit_size_mib  < 0 ? 0 : limit_size_mib);
         this->limit_tokens    = limit_tokens;
         this->limit_size_disk = 1024ull*1024ull*(limit_disk_mib  < 0 ? 0 : limit_disk_mib);
@@ -646,6 +648,9 @@ struct server_prompt_cache {
     // by a different model, quantisation or context size would be silent garbage, and several
     // models share one cache directory
     std::string fingerprint;
+
+    // hours since a file was last written before it is discarded, 0 = never
+    int32_t ttl_hours = 0;
 
     size_t size() const;
 
@@ -681,6 +686,16 @@ struct server_prompt_cache {
 
     // move every RAM-resident entry to disk. RAM does not survive the process
     size_t flush_to_disk();
+
+    // hours since the file was last written, or -1 if that cannot be determined
+    double file_age_hours(const std::string & path) const;
+
+    // mark a file as used. NOT called on adoption: a frequently restarted server would
+    // otherwise keep dead conversations alive forever
+    void touch(const std::string & path) const;
+
+    // drop entries whose file has aged past the ttl
+    size_t expire_stale();
 
     // erase an entry and its file together
     std::list<server_prompt_cache_state>::iterator drop(std::list<server_prompt_cache_state>::iterator it);

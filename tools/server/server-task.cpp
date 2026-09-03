@@ -1,6 +1,7 @@
 #include "server-task.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -1761,7 +1762,16 @@ void server_prompt_cache::load_dir() {
 
     size_t n_ok = 0;
 
+    size_t n_stale = 0;
+
     for (const auto & path : mine) {
+        const double age = file_age_hours(path);
+        if (ttl_hours > 0 && age >= 0.0 && age > (double) ttl_hours) {
+            std::remove(path.c_str());
+            n_stale++;
+            continue;
+        }
+
         std::ifstream f(path, std::ios::binary);
 
         uint32_t magic = 0;
@@ -1817,12 +1827,60 @@ void server_prompt_cache::load_dir() {
         n_ok++;
     }
 
-    if (n_ok > 0) {
-        SRV_INF("prompt cache: adopted %zu entries (%.3f MiB) left on disk by an earlier run\n",
-                n_ok, size_disk() / (1024.0 * 1024.0));
+    if (n_ok > 0 || n_stale > 0) {
+        SRV_INF("prompt cache: adopted %zu entries (%.3f MiB) left on disk by an earlier run, discarded %zu older than %d h\n",
+                n_ok, size_disk() / (1024.0 * 1024.0), n_stale, ttl_hours);
     }
 
     update();
+}
+
+double server_prompt_cache::file_age_hours(const std::string & path) const {
+    std::error_code ec;
+    const auto t = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return -1.0;
+    }
+
+    const auto age = std::filesystem::file_time_type::clock::now() - t;
+
+    return std::chrono::duration_cast<std::chrono::minutes>(age).count() / 60.0;
+}
+
+void server_prompt_cache::touch(const std::string & path) const {
+    if (path.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
+}
+
+size_t server_prompt_cache::expire_stale() {
+    if (ttl_hours <= 0) {
+        return 0;
+    }
+
+    size_t n = 0;
+
+    for (auto it = states.begin(); it != states.end();) {
+        if (it->file.empty()) {
+            ++it;
+            continue;
+        }
+
+        const double age = file_age_hours(it->file);
+        if (age >= 0.0 && age > (double) ttl_hours) {
+            SRV_INF("prompt cache: discarding an entry unused for %.1f h (%zu tokens, %.3f MiB)\n",
+                    age, (size_t) it->prompt.n_tokens(), it->size_disk / (1024.0 * 1024.0));
+            it = drop(it);
+            n++;
+        } else {
+            ++it;
+        }
+    }
+
+    return n;
 }
 
 size_t server_prompt_cache::flush_to_disk() {
@@ -2255,6 +2313,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update() {
+    // age first: a stale entry should not be what forces a live one out on size
+    expire_stale();
+
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
             auto it = states.begin();

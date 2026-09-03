@@ -1724,6 +1724,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-ttl"}, "N",
+        string_format("discard a disk prompt-cache entry that has not been written for N hours. An entry is rewritten every time its slot is parked, so a conversation still in use stays fresh and a dead one ages out. (default: %d, 0 = never expire)", params.cache_disk_ttl_h),
+        [](common_params & params, int value) {
+            params.cache_disk_ttl_h = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_TTL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

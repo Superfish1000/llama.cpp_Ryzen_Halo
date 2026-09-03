@@ -1377,8 +1377,24 @@ private:
                 }
 
                 // a state is only meaningful to the model and KV geometry that produced it
+                // the weights themselves are part of the identity: a requantised GGUF at the
+                // same path would otherwise match, and its states would restore into the new
+                // model without error and with quietly wrong output
+                std::string model_id = params_base.model.path;
+                {
+                    std::error_code ec;
+                    const auto sz = std::filesystem::file_size(params_base.model.path, ec);
+                    if (!ec) {
+                        model_id += ":" + std::to_string((unsigned long long) sz);
+                    }
+                    const auto mt = std::filesystem::last_write_time(params_base.model.path, ec);
+                    if (!ec) {
+                        model_id += ":" + std::to_string((long long) mt.time_since_epoch().count());
+                    }
+                }
+
                 const std::string fingerprint =
-                    params_base.model.path + "|" +
+                    model_id + "|" +
                     std::to_string(n_ctx) + "|" +
                     std::to_string(params_base.n_parallel) + "|" +
                     std::to_string((int) params_base.cache_type_k) + "|" +
@@ -1386,13 +1402,15 @@ private:
                     (params_base.kv_unified ? "u" : "s");
 
                 prompt_cache = std::make_unique<server_prompt_cache>(
-                        params_base.cache_ram_mib, n_ctx, params_base.cache_disk_mib, dir_disk, fingerprint);
+                        params_base.cache_ram_mib, n_ctx, params_base.cache_disk_mib, dir_disk, fingerprint,
+                        params_base.cache_disk_ttl_h);
 
                 // pick up what an earlier run of this same model left behind
                 prompt_cache->load_dir();
 
                 if (params_base.cache_disk_mib != 0) {
-                    SRV_INF("prompt cache disk tier enabled: %d MiB in %s\n", params_base.cache_disk_mib, dir_disk.c_str());
+                    SRV_INF("prompt cache disk tier enabled: %d MiB in %s, entries expire after %d h\n",
+                            params_base.cache_disk_mib, dir_disk.c_str(), params_base.cache_disk_ttl_h);
                 }
             }
         } else {
