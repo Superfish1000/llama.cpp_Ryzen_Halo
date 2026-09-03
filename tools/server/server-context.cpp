@@ -1742,7 +1742,12 @@ private:
                 // prompt would evict a long conversation. never pay that while a slot is free.
                 const float f_keep_cur = float(lcp_len) / tokens.size();
 
-                if (f_keep_cur < 0.5f && slot_empty != nullptr) {
+                // an occupied slot is worth taking only to CONTINUE what is in it, which scores near 1.0
+                // because everything it holds is a prefix of the new prompt. materially below that is a
+                // different conversation: seating it here trims the tail off the one already there, which
+                // rebuilds that tail on its next turn and evicts this one right back. two chats sharing an
+                // agent's system prompt do that to each other forever. an empty slot costs nobody anything.
+                if (f_keep_cur < 0.9f && slot_empty != nullptr) {
                     SLT_TRC(slot, " - skipping, reuse would discard %.0f%% of this slot and a free one exists\n",
                             100.0f*(1.0f - f_keep_cur));
                     continue;
