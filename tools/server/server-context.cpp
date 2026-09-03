@@ -1771,8 +1771,11 @@ private:
                             f_sim_best, slot_prompt_similarity, f_keep);
                 }
 
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
+                // anything that is not a straight continuation of what this slot holds will cost the
+                // conversation already in it, so write that one to the prompt cache before taking the
+                // slot. the same 0.9 the selection uses: below it we are displacing someone, not
+                // continuing them, and they must be able to come back
+                if (f_keep < 0.9f) {
                     update_cache = true;
                 }
             }
