@@ -615,7 +615,9 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int32_t limit_disk_mib = 0, const std::string & dir = "") {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int32_t limit_disk_mib = 0,
+                        const std::string & dir = "", const std::string & fingerprint = "") {
+        this->fingerprint = fingerprint;
         this->limit_size      = 1024ull*1024ull*(limit_size_mib  < 0 ? 0 : limit_size_mib);
         this->limit_tokens    = limit_tokens;
         this->limit_size_disk = 1024ull*1024ull*(limit_disk_mib  < 0 ? 0 : limit_disk_mib);
@@ -623,12 +625,8 @@ struct server_prompt_cache {
         this->disk_enabled    = limit_disk_mib != 0 && !dir.empty();
     }
 
-    ~server_prompt_cache() {
-        // leaving gigabytes of state files behind would fill the disk over a few restarts
-        for (auto & st : states) {
-            unlink_state(st);
-        }
-    }
+    // no destructor: the files are the point. they outlive the process and are picked up
+    // again by load_dir(), bounded by --cache-disk rather than by shutdown.
 
     std::list<server_prompt_cache_state> states;
 
@@ -643,6 +641,11 @@ struct server_prompt_cache {
     std::string dir_disk;
     bool        disk_enabled = false;
     size_t      file_seq = 0;
+
+    // identifies the model and KV geometry that produced a file. restoring a state written
+    // by a different model, quantisation or context size would be silent garbage, and several
+    // models share one cache directory
+    std::string fingerprint;
 
     size_t size() const;
 
@@ -672,6 +675,9 @@ struct server_prompt_cache {
     // called once the caller has written the state bytes into an entry from alloc(): an
     // entry that does not belong in the RAM tier is moved to disk right away
     void after_fill(server_prompt_cache_state * state);
+
+    // adopt this model's files left by an earlier run; delete its stale ones
+    void load_dir();
 
     // erase an entry and its file together
     std::list<server_prompt_cache_state>::iterator drop(std::list<server_prompt_cache_state>::iterator it);

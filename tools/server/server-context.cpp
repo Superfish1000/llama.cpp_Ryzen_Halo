@@ -1376,8 +1376,20 @@ private:
                     params_base.cache_disk_mib = 0;
                 }
 
+                // a state is only meaningful to the model and KV geometry that produced it
+                const std::string fingerprint =
+                    params_base.model.path + "|" +
+                    std::to_string(n_ctx) + "|" +
+                    std::to_string(params_base.n_parallel) + "|" +
+                    std::to_string((int) params_base.cache_type_k) + "|" +
+                    std::to_string((int) params_base.cache_type_v) + "|" +
+                    (params_base.kv_unified ? "u" : "s");
+
                 prompt_cache = std::make_unique<server_prompt_cache>(
-                        params_base.cache_ram_mib, n_ctx, params_base.cache_disk_mib, dir_disk);
+                        params_base.cache_ram_mib, n_ctx, params_base.cache_disk_mib, dir_disk, fingerprint);
+
+                // pick up what an earlier run of this same model left behind
+                prompt_cache->load_dir();
 
                 if (params_base.cache_disk_mib != 0) {
                     SRV_INF("prompt cache disk tier enabled: %d MiB in %s\n", params_base.cache_disk_mib, dir_disk.c_str());

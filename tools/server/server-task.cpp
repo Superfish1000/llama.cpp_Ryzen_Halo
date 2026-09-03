@@ -1,7 +1,10 @@
 #include "server-task.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <unistd.h>
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -1691,6 +1694,137 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+// on-disk entry: header, prompt tokens, then the raw sequence state.
+//   magic | version | fingerprint | tokens | state bytes
+static const uint32_t PROMPT_CACHE_MAGIC   = 0x4c504331; // "LPC1"
+static const uint32_t PROMPT_CACHE_VERSION = 1;
+
+// short stable tag so one directory can hold several models' entries
+static std::string prompt_cache_tag(const std::string & fingerprint) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : fingerprint) {
+        h = (h ^ c) * 1099511628211ull;
+    }
+
+    char buf[17];
+    snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) h);
+
+    return std::string(buf);
+}
+
+static void write_str(std::ostream & f, const std::string & v) {
+    const uint64_t n = v.size();
+    f.write((const char *) &n, sizeof(n));
+    f.write(v.data(), n);
+}
+
+static bool read_str(std::istream & f, std::string & v, size_t limit) {
+    uint64_t n = 0;
+    f.read((char *) &n, sizeof(n));
+    if (!f || n > limit) {
+        return false;
+    }
+    v.resize(n);
+    if (n) {
+        f.read(&v[0], n);
+    }
+    return (bool) f;
+}
+
+void server_prompt_cache::load_dir() {
+    if (!disk_enabled) {
+        return;
+    }
+
+    const std::string tag = prompt_cache_tag(fingerprint);
+
+    std::vector<std::string> mine;
+
+    {
+        std::error_code ec;
+        std::filesystem::directory_iterator it(dir_disk, ec);
+        if (ec) {
+            SRV_WRN("prompt cache: cannot read %s: %s\n", dir_disk.c_str(), ec.message().c_str());
+            return;
+        }
+
+        for (const auto & e : it) {
+            const std::string name = e.path().filename().string();
+            // only this model's files; another model's entries are none of our business
+            if (name.rfind("pc-" + tag + "-", 0) == 0) {
+                mine.push_back(e.path().string());
+            }
+        }
+    }
+
+    std::sort(mine.begin(), mine.end());
+
+    size_t n_ok = 0;
+
+    for (const auto & path : mine) {
+        std::ifstream f(path, std::ios::binary);
+
+        uint32_t magic = 0;
+        uint32_t version = 0;
+        std::string fp;
+        uint64_t n_tokens = 0;
+
+        bool ok = (bool) f;
+        if (ok) {
+            f.read((char *) &magic,   sizeof(magic));
+            f.read((char *) &version, sizeof(version));
+            ok = f && magic == PROMPT_CACHE_MAGIC && version == PROMPT_CACHE_VERSION;
+        }
+        if (ok) {
+            ok = read_str(f, fp, 4096) && fp == fingerprint;
+        }
+        if (ok) {
+            f.read((char *) &n_tokens, sizeof(n_tokens));
+            ok = f && n_tokens > 0 && n_tokens < (1ull << 32);
+        }
+
+        llama_tokens toks;
+        if (ok) {
+            try {
+                toks.resize(n_tokens);
+            } catch (const std::bad_alloc &) {
+                ok = false;
+            }
+        }
+        if (ok) {
+            f.read((char *) toks.data(), n_tokens*sizeof(llama_token));
+            ok = (bool) f;
+        }
+
+        if (!ok) {
+            // ours by name but unreadable or from an older layout
+            f.close();
+            std::remove(path.c_str());
+            SRV_WRN("prompt cache: discarded unusable entry %s\n", path.c_str());
+            continue;
+        }
+
+        std::error_code ec;
+        const auto bytes = std::filesystem::file_size(path, ec);
+
+        server_prompt_cache_state st;
+        st.prompt.tokens = server_tokens(toks, false);
+        st.file          = path;
+        st.size_disk     = ec ? 0 : (size_t) bytes;
+
+        states.push_back(std::move(st));
+
+        n_ok++;
+    }
+
+    if (n_ok > 0) {
+        SRV_INF("prompt cache: adopted %zu entries (%.3f MiB) left on disk by an earlier run\n",
+                n_ok, size_disk() / (1024.0 * 1024.0));
+    }
+
+    update();
+}
+
 void server_prompt_cache::unlink_state(server_prompt_cache_state & state) {
     if (!state.file.empty()) {
         std::remove(state.file.c_str());
@@ -1719,7 +1853,8 @@ bool server_prompt_cache::demote(server_prompt_cache_state & state) {
         return false;
     }
 
-    const std::string path = dir_disk + "/prompt-cache-" + std::to_string(++file_seq) + ".bin";
+    const std::string path = dir_disk + "/pc-" + prompt_cache_tag(fingerprint) + "-" +
+                             std::to_string(getpid()) + "-" + std::to_string(++file_seq) + ".bin";
 
     std::ofstream f(path, std::ios::binary);
     if (!f) {
@@ -1729,6 +1864,20 @@ bool server_prompt_cache::demote(server_prompt_cache_state & state) {
 
     const uint64_t n_main = state.data.main.size();
     const uint64_t n_drft = state.data.drft.size();
+
+    // header first, so a later run can tell what this file holds and whether it may use it
+    f.write((const char *) &PROMPT_CACHE_MAGIC,   sizeof(PROMPT_CACHE_MAGIC));
+    f.write((const char *) &PROMPT_CACHE_VERSION, sizeof(PROMPT_CACHE_VERSION));
+    write_str(f, fingerprint);
+
+    {
+        const llama_tokens toks = state.prompt.tokens.get_text_tokens();
+        const uint64_t n = toks.size();
+        f.write((const char *) &n, sizeof(n));
+        if (n) {
+            f.write((const char *) toks.data(), n*sizeof(llama_token));
+        }
+    }
 
     f.write((const char *) &n_main, sizeof(n_main));
     f.write((const char *) &n_drft, sizeof(n_drft));
@@ -1747,7 +1896,11 @@ bool server_prompt_cache::demote(server_prompt_cache_state & state) {
     }
 
     state.file      = path;
-    state.size_disk = 2*sizeof(uint64_t) + n_main + n_drft;
+    {
+        std::error_code ec;
+        const auto bytes = std::filesystem::file_size(path, ec);
+        state.size_disk = ec ? (2*sizeof(uint64_t) + n_main + n_drft) : (size_t) bytes;
+    }
 
     state.data.main.clear(); state.data.main.shrink_to_fit();
     state.data.drft.clear(); state.data.drft.shrink_to_fit();
@@ -1770,6 +1923,32 @@ bool server_prompt_cache::promote(server_prompt_cache_state & state) {
 
     uint64_t n_main = 0;
     uint64_t n_drft = 0;
+
+    {
+        // header: magic, version, fingerprint, tokens. all of it was checked when the entry
+        // was adopted or written, so here it only has to be stepped over
+        uint32_t magic = 0;
+        uint32_t version = 0;
+        std::string fp;
+        uint64_t n_tokens = 0;
+
+        f.read((char *) &magic,   sizeof(magic));
+        f.read((char *) &version, sizeof(version));
+
+        if (!f || magic != PROMPT_CACHE_MAGIC || version != PROMPT_CACHE_VERSION || !read_str(f, fp, 4096) || fp != fingerprint) {
+            SRV_WRN(" - prompt cache file %s does not belong to this model\n", state.file.c_str());
+            return false;
+        }
+
+        f.read((char *) &n_tokens, sizeof(n_tokens));
+        if (!f) {
+            return false;
+        }
+        f.seekg(n_tokens*sizeof(llama_token), std::ios::cur);
+        if (!f) {
+            return false;
+        }
+    }
 
     f.read((char *) &n_main, sizeof(n_main));
     f.read((char *) &n_drft, sizeof(n_drft));
