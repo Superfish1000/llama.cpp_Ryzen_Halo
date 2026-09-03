@@ -274,6 +274,9 @@ struct server_slot {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
+        // the bytes are in RAM now; the cache decides whether they stay there
+        prompt_cache.after_fill(cur);
+
         return true;
     }
 

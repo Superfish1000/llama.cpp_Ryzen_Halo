@@ -669,6 +669,10 @@ struct server_prompt_cache {
 
     void unlink_state(server_prompt_cache_state & state);
 
+    // called once the caller has written the state bytes into an entry from alloc(): an
+    // entry that does not belong in the RAM tier is moved to disk right away
+    void after_fill(server_prompt_cache_state * state);
+
     // erase an entry and its file together
     std::list<server_prompt_cache_state>::iterator drop(std::list<server_prompt_cache_state>::iterator it);
 };

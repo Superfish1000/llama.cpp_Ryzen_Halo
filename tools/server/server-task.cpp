@@ -1809,6 +1809,24 @@ bool server_prompt_cache::promote(server_prompt_cache_state & state) {
     return true;
 }
 
+void server_prompt_cache::after_fill(server_prompt_cache_state * state) {
+    if (state == nullptr || !disk_enabled) {
+        return;
+    }
+
+    // keep it in RAM only if the RAM tier was asked to hold that much
+    if (limit_size == 0 || (state->data.size() <= limit_size && size() <= limit_size)) {
+        return;
+    }
+
+    if (!demote(*state)) {
+        return;
+    }
+
+    SRV_TRC(" - new prompt state went straight to the disk tier (%.3f MiB, disk now %.3f MiB)\n",
+            state->size_disk / (1024.0 * 1024.0), size_disk() / (1024.0 * 1024.0));
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1848,8 +1866,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
 
-    // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
+    // skip over-limit entries to avoid disturbing the cache. an entry too big for the RAM
+    // tier is still worth keeping when the disk tier can hold it: after_fill() writes it out
+    const bool fits_disk = disk_enabled && (limit_size_disk == 0 || state_size_new <= limit_size_disk);
+
+    if (limit_size > 0 && state_size_new > limit_size && !fits_disk) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
         return nullptr;
@@ -1868,8 +1889,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
+    if (limit_size > 0 && state_size_new <= limit_size) {
+        // make room before allocating the new vectors to avoid breaching the limit.
+        // an entry that is headed for disk anyway does not evict anything
         while (!states.empty() && size() + state_size_new > limit_size) {
             // the oldest RAM-resident entry goes to the disk tier rather than being lost
             auto it = states.begin();
