@@ -603,6 +603,10 @@ struct server_prompt_cache_state {
     std::string file;
     size_t      size_disk = 0;
 
+    // a prefix a caller shares across its conversations. copied on load instead of consumed,
+    // never dropped for being contained in a longer prompt, exempt from eviction
+    bool shared = false;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -642,6 +646,9 @@ struct server_prompt_cache {
     size_t      limit_size_disk = 0;
     std::string dir_disk;
     bool        disk_enabled = false;
+
+    // set immediately before the save that should become a held prefix
+    bool        mark_next_shared = false;
     size_t      file_seq = 0;
 
     // identifies the model and KV geometry that produced a file. restoring a state written
@@ -696,6 +703,15 @@ struct server_prompt_cache {
 
     // drop entries whose file has aged past the ttl
     size_t expire_stale();
+
+    // the held prefix whose tokens are exactly these, if it is held
+    server_prompt_cache_state * get_shared(const server_tokens & tokens);
+
+    // every held prefix, longest first
+    std::vector<server_prompt_cache_state *> get_shared_all();
+
+    // remove the oldest entry that is not a held prefix; false when there is none
+    bool drop_oldest_unshared();
 
     // erase an entry and its file together
     std::list<server_prompt_cache_state>::iterator drop(std::list<server_prompt_cache_state>::iterator it);

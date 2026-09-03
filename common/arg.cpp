@@ -1738,6 +1738,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SECS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefix-cache"},
+        {"--no-prefix-cache"},
+        "hold the prompt prefix each caller shares across its conversations as a cache entry of its own, so a new chat starts from it instead of re-prefilling it. Learned from traffic and refined as prompts arrive, copied on load rather than consumed, written to disk and adopted at startup (default: disabled)",
+        [](common_params & params, bool value) {
+            params.prefix_cache = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefix-cache-count"}, "N",
+        string_format("how many prefix families to hold at once, one per caller that shares a system prompt (default: %d)", params.prefix_cache_count),
+        [](common_params & params, int value) {
+            params.prefix_cache_count = std::max(1, value);
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE_COUNT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefix-cache-min"}, "N",
+        string_format("shortest prefix worth holding, in tokens (default: %d)", params.prefix_cache_min),
+        [](common_params & params, int value) {
+            params.prefix_cache_min = std::max(1, value);
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefix-cache-max"}, "N",
+        string_format("longest prefix worth holding, in tokens (default: %d)", params.prefix_cache_max),
+        [](common_params & params, int value) {
+            params.prefix_cache_max = std::max(1, value);
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

@@ -1698,7 +1698,7 @@ json server_task_result_apply_lora::to_json() {
 // on-disk entry: header, prompt tokens, then the raw sequence state.
 //   magic | version | fingerprint | tokens | state bytes
 static const uint32_t PROMPT_CACHE_MAGIC   = 0x4c504331; // "LPC1"
-static const uint32_t PROMPT_CACHE_VERSION = 1;
+static const uint32_t PROMPT_CACHE_VERSION = 2;
 
 // short stable tag so one directory can hold several models' entries
 static std::string prompt_cache_tag(const std::string & fingerprint) {
@@ -1788,6 +1788,12 @@ void server_prompt_cache::load_dir() {
         if (ok) {
             ok = read_str(f, fp, 4096) && fp == fingerprint;
         }
+        uint8_t is_shared = 0;
+        if (ok) {
+            f.read((char *) &is_shared, sizeof(is_shared));
+            ok = (bool) f;
+        }
+
         if (ok) {
             f.read((char *) &n_tokens, sizeof(n_tokens));
             ok = f && n_tokens > 0 && n_tokens < (1ull << 32);
@@ -1819,6 +1825,7 @@ void server_prompt_cache::load_dir() {
 
         server_prompt_cache_state st;
         st.prompt.tokens = server_tokens(toks, false);
+        st.shared        = is_shared != 0;
         st.file          = path;
         st.size_disk     = ec ? 0 : (size_t) bytes;
 
@@ -1864,7 +1871,8 @@ size_t server_prompt_cache::expire_stale() {
     size_t n = 0;
 
     for (auto it = states.begin(); it != states.end();) {
-        if (it->file.empty()) {
+        // a held prefix does not age out; it is what every new conversation starts from
+        if (it->file.empty() || it->shared) {
             ++it;
             continue;
         }
@@ -1920,6 +1928,45 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::drop(std::li
     return states.erase(it);
 }
 
+server_prompt_cache_state * server_prompt_cache::get_shared(const server_tokens & tokens) {
+    for (auto & state : states) {
+        if (state.shared &&
+            state.prompt.tokens.size() == tokens.size() &&
+            state.prompt.tokens.get_common_prefix(tokens) == tokens.size()) {
+            return &state;
+        }
+    }
+
+    return nullptr;
+}
+
+std::vector<server_prompt_cache_state *> server_prompt_cache::get_shared_all() {
+    std::vector<server_prompt_cache_state *> res;
+
+    for (auto & state : states) {
+        if (state.shared) {
+            res.push_back(&state);
+        }
+    }
+
+    std::sort(res.begin(), res.end(), [](const server_prompt_cache_state * a, const server_prompt_cache_state * b) {
+        return a->prompt.tokens.size() > b->prompt.tokens.size();
+    });
+
+    return res;
+}
+
+bool server_prompt_cache::drop_oldest_unshared() {
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (!it->shared) {
+            drop(it);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 size_t server_prompt_cache::size_disk() const {
     size_t res = 0;
 
@@ -1951,6 +1998,11 @@ bool server_prompt_cache::demote(server_prompt_cache_state & state) {
     f.write((const char *) &PROMPT_CACHE_MAGIC,   sizeof(PROMPT_CACHE_MAGIC));
     f.write((const char *) &PROMPT_CACHE_VERSION, sizeof(PROMPT_CACHE_VERSION));
     write_str(f, fingerprint);
+
+    {
+        const uint8_t is_shared = state.shared ? 1 : 0;
+        f.write((const char *) &is_shared, sizeof(is_shared));
+    }
 
     {
         const llama_tokens toks = state.prompt.tokens.get_text_tokens();
@@ -2012,6 +2064,7 @@ bool server_prompt_cache::promote(server_prompt_cache_state & state) {
         uint32_t magic = 0;
         uint32_t version = 0;
         std::string fp;
+        uint8_t is_shared = 0;
         uint64_t n_tokens = 0;
 
         f.read((char *) &magic,   sizeof(magic));
@@ -2022,6 +2075,7 @@ bool server_prompt_cache::promote(server_prompt_cache_state & state) {
             return false;
         }
 
+        f.read((char *) &is_shared, sizeof(is_shared));
         f.read((char *) &n_tokens, sizeof(n_tokens));
         if (!f) {
             return false;
@@ -2141,7 +2195,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (len == (int) it->prompt.tokens.size() && !it->shared) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = drop(it);
@@ -2169,7 +2223,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
-            drop(states.begin());
+            if (!drop_oldest_unshared()) {
+                break;   // only held prefixes remain, and those are not up for eviction
+            }
         }
     }
 
@@ -2192,6 +2248,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    const bool as_shared = mark_next_shared;
+    mark_next_shared = false;
+
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
@@ -2202,6 +2261,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.drft =*/ std::move(state_data_dft),
         },
     });
+
+    states.back().shared = as_shared;
 
     return &states.back();
 }
@@ -2304,9 +2365,20 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
 
-        prompt = std::move(it_best->prompt);
+        if (it_best->shared) {
+            // the next conversation of this family needs it too
+            prompt = it_best->prompt.clone();
 
-        drop(it_best);
+            // promote() consumed the file to read it back; write it out again so the
+            // prefix still survives a restart
+            if (it_best->file.empty() && !it_best->data.main.empty()) {
+                demote(*it_best);
+            }
+        } else {
+            prompt = std::move(it_best->prompt);
+
+            drop(it_best);
+        }
     }
 
     return true;
@@ -2330,14 +2402,16 @@ void server_prompt_cache::update() {
 
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
-            drop(states.begin());
+            if (!drop_oldest_unshared()) {
+                break;   // only held prefixes remain, and those are not up for eviction
+            }
         }
     }
 
     if (limit_size_disk > 0) {
         while (size_disk() > limit_size_disk) {
             auto it = states.begin();
-            while (it != states.end() && it->file.empty()) {
+            while (it != states.end() && (it->file.empty() || it->shared)) {
                 ++it;
             }
 
@@ -2362,7 +2436,9 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
-            drop(states.begin());
+            if (!drop_oldest_unshared()) {
+                break;   // only held prefixes remain, and those are not up for eviction
+            }
         }
     }
 

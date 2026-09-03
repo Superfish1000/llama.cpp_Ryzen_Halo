@@ -622,6 +622,10 @@ struct common_params {
     std::string cache_disk_path;         // where disk-tier entries are written (default: --slot-save-path)
     int32_t cache_disk_ttl_h    = 168;   // discard disk-tier entries older than this many hours (0 = never)
     int32_t cache_idle_secs     = 300;   // park a slot to the prompt cache after this long idle (0 = off)
+    bool    prefix_cache        = false; // hold shared prompt prefixes as cache entries of their own
+    int32_t prefix_cache_count  = 4;     // how many distinct prefix families to hold at once
+    int32_t prefix_cache_min    = 512;   // do not bother below this many tokens
+    int32_t prefix_cache_max    = 32768; // never hold more than this many tokens as one prefix
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
