@@ -1685,6 +1685,16 @@ private:
             }
         }
 
+        // a slot with nothing in it can take any request without costing anyone their context,
+        // so it is the yardstick for whether a destructive choice is worth making at all
+        server_slot * slot_empty = nullptr;
+        for (server_slot & slot : slots) {
+            if (!slot.is_processing() && slot.prompt.tokens.empty()) {
+                slot_empty = &slot;
+                break;
+            }
+        }
+
         // find the slot that has at least n% prompt similarity
         if (slot_prompt_similarity != 0.0f) {
             float f_sim_best = 0;
@@ -1711,6 +1721,18 @@ private:
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
                 const float f_sim_cur = float(lcp_len) / task.tokens.size();
+
+                // ... and the fraction of THIS slot that would survive being reused. similarity
+                // alone makes the slot holding the longest shared prefix look like the best match
+                // precisely because it holds the most, so a short prompt sharing an agent's system
+                // prompt would evict a long conversation. never pay that while a slot is free.
+                const float f_keep_cur = float(lcp_len) / tokens.size();
+
+                if (f_keep_cur < 0.5f && slot_empty != nullptr) {
+                    SLT_TRC(slot, " - skipping, reuse would discard %.0f%% of this slot and a free one exists\n",
+                            100.0f*(1.0f - f_keep_cur));
+                    continue;
+                }
 
                 SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
 
@@ -1741,9 +1763,21 @@ private:
         if (ret == nullptr) {
             int64_t t_last = -1;
 
+            // an empty slot costs nobody anything, so it goes first regardless of age
+            if (slot_empty != nullptr) {
+                ret = slot_empty;
+                t_last = slot_empty->t_last_used;
+            }
+
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
+                    continue;
+                }
+
+                // an empty slot has already been taken above; never displace it with a
+                // populated one just because that one is older
+                if (slot_empty != nullptr && !slot.prompt.tokens.empty()) {
                     continue;
                 }
 
