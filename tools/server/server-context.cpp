@@ -1728,6 +1728,25 @@ private:
 
         bool update_cache = false;
 
+        // everything below reuses whatever a slot already holds, which is exactly why a family
+        // that has shaved to a shorter boundary can never be captured again: no prefill starts
+        // below it any more. one request pays for a cold start so that boundary can be held
+        prefix_family * fam_capture = nullptr;
+
+        if (params_base.prefix_cache && prompt_cache && task.id_slot == -1 &&
+            task.type == SERVER_TASK_TYPE_COMPLETION && !task.is_child() && !task.tokens.has_mtmd) {
+            auto * fam = prefix_family_for(task.tokens);
+
+            // only when this prompt agrees with the whole family and extends past it, so the
+            // prefill is certain to cross the boundary and the capture is certain to be exact
+            if (fam != nullptr && !prefix_held(fam->tokens) &&
+                (int) fam->tokens.get_common_prefix(task.tokens) == (int) fam->tokens.size() &&
+                (int) task.tokens.size() > (int) fam->tokens.size() &&
+                ggml_time_us() - fam->t_capture_try > 300ll*1000000) {
+                fam_capture = fam;
+            }
+        }
+
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
@@ -1852,6 +1871,30 @@ private:
 
                 update_cache = true;
             }
+        }
+
+        if (ret && fam_capture != nullptr) {
+            // an empty slot costs nobody their context, so take one if there is one rather than
+            // whatever the similarity scan preferred
+            if (slot_empty != nullptr && !slot_empty->is_processing()) {
+                ret = slot_empty;
+            }
+
+            fam_capture->t_capture_try = ggml_time_us();
+
+            // whatever this slot held is written out before it goes, so resuming that
+            // conversation costs a cache load rather than a rebuild
+            if (prompt_cache) {
+                ret->prompt_save(*prompt_cache);
+                prompt_cache->update();
+            }
+
+            ret->prompt_clear();
+
+            SLT_INF(*ret, "prefix cache: starting cold to capture this family's %d token prefix\n",
+                    (int) fam_capture->tokens.size());
+
+            return ret;
         }
 
         if (ret) {
@@ -1983,6 +2026,10 @@ private:
         // pending length meant two callers diverging in different places reset each other's
         // count forever, so a shave could never be confirmed
         std::vector<std::pair<size_t, int>> pending;
+
+        // when this family last paid for a cold prefill to capture its boundary. a capture
+        // that keeps failing must not turn every request into a rebuild
+        int64_t t_capture_try = 0;
     };
 
     std::vector<prefix_family> prefix_families;
