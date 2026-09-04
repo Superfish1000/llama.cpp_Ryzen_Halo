@@ -1871,8 +1871,9 @@ size_t server_prompt_cache::expire_stale() {
     size_t n = 0;
 
     for (auto it = states.begin(); it != states.end();) {
-        // a held prefix does not age out; it is what every new conversation starts from
-        if (it->file.empty() || it->shared) {
+        // a held prefix is stamped every time it is used, so the ttl here measures disuse: one
+        // that nothing has started from in a week is one nobody sends any more
+        if (it->file.empty()) {
             ++it;
             continue;
         }
@@ -2318,6 +2319,27 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    if (it_best == states.end() && !states.empty()) {
+        // a rebuild from nothing should never be silent. report the closest entry and why it
+        // could not be used: on a model whose recurrent state cannot be rewound, an entry longer
+        // than the prompt is unusable however well its prefix matches.
+        size_t best_lcp_seen = 0;
+        size_t best_len_seen = 0;
+
+        for (const auto & st : states) {
+            const size_t lcp = st.prompt.tokens.get_common_prefix(tokens_new);
+            if (lcp > best_lcp_seen) {
+                best_lcp_seen = lcp;
+                best_len_seen = st.prompt.tokens.size();
+            }
+        }
+
+        SRV_INF(" - prompt cache declined: %zu entries, best shares %zu tokens of a %zu token entry,"
+                " prompt is %zu tokens (f_keep = %.3f; needs >= 0.250 and an entry no longer than the prompt)\n",
+                states.size(), best_lcp_seen, best_len_seen, tokens_new.size(),
+                best_len_seen > 0 ? float(best_lcp_seen)/best_len_seen : 0.0f);
+    }
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
@@ -2368,6 +2390,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         if (it_best->shared) {
             // the next conversation of this family needs it too
             prompt = it_best->prompt.clone();
+
+            // held prefixes are exempt from size eviction but not from disuse: stamp it so the
+            // ttl measures time since it was last useful, not time since it was written
+            touch(it_best->file);
 
             // promote() consumed the file to read it back; write it out again so the
             // prefix still survives a restart
