@@ -1411,11 +1411,36 @@ private:
                         params_base.cache_ram_mib, n_ctx, params_base.cache_disk_mib, dir_disk, fingerprint,
                         params_base.cache_disk_ttl_h);
 
+                // an entry may only serve a prompt that extends it exactly unless this model
+                // can rewind a restored state
+                prompt_cache->require_exact_prefix = (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+
                 // pick up what an earlier run of this same model left behind
                 prompt_cache->load_dir();
 
                 if (params_base.prefix_cache) {
-                    for (auto * st : prompt_cache->get_shared_all()) {
+                    const auto shared_all = prompt_cache->get_shared_all();
+
+                    for (auto * st : shared_all) {
+                        // shorter is strictly more useful here: a shorter held prefix serves
+                        // every prompt a longer one would. if an earlier run left two that are
+                        // prefixes of one another, adopt only the shorter
+                        bool superseded = false;
+
+                        for (auto * other : shared_all) {
+                            const int len_o = (int) other->prompt.tokens.size();
+
+                            if (other != st && len_o < (int) st->prompt.tokens.size() &&
+                                other->prompt.tokens.get_common_prefix(st->prompt.tokens) == len_o) {
+                                superseded = true;
+                                break;
+                            }
+                        }
+
+                        if (superseded) {
+                            continue;
+                        }
+
                         prefix_family fam_new;
                         fam_new.tokens = st->prompt.tokens.clone();
                         prefix_families.push_back(std::move(fam_new));
@@ -1942,10 +1967,10 @@ private:
     struct prefix_family {
         server_tokens tokens;        // the agreed prefix, as confirmed so far
 
-        // a shorter agreement point seen but not yet acted on. one unusual prompt should move
-        // the target without costing the copy we already hold
-        size_t pending_len = 0;
-        int    pending_n   = 0;
+        // divergence points seen since the last shave, and how often each was seen. a single
+        // pending length meant two callers diverging in different places reset each other's
+        // count forever, so a shave could never be confirmed
+        std::vector<std::pair<size_t, int>> pending;
     };
 
     std::vector<prefix_family> prefix_families;
@@ -2005,44 +2030,60 @@ private:
         const size_t lcp = fam->tokens.get_common_prefix(tokens);
 
         if (lcp >= fam->tokens.size()) {
-            // this prompt agrees with all of it
-            fam->pending_len = 0;
-            fam->pending_n   = 0;
+            // this prompt agrees with all of it. that says nothing about where the NEXT
+            // conversation diverges, so the evidence gathered so far is kept, not zeroed
             return;
         }
 
-        // a shorter agreement point. wait for a second prompt to say the same before giving up
-        // what we hold: one unusual prompt should not cost everyone the prefix
-        if (fam->pending_len == lcp) {
-            fam->pending_n++;
-        } else {
-            fam->pending_len = lcp;
-            fam->pending_n   = 1;
+        // a shorter agreement point. wait for a second prompt to name the same one before
+        // giving up what we hold: one unusual prompt should not cost everyone the prefix
+        int n_seen = 0;
 
+        for (auto & p : fam->pending) {
+            if (p.first == lcp) {
+                n_seen = ++p.second;
+                break;
+            }
+        }
+
+        if (n_seen == 0) {
+            fam->pending.push_back(std::make_pair(lcp, 1));
+            n_seen = 1;
+        }
+
+        if (n_seen < 2) {
             SRV_INF("prefix cache: a prompt agrees to only %d of %d tokens, waiting for a second\n",
                     (int) lcp, (int) fam->tokens.size());
             return;
         }
 
-        if (fam->pending_n < 2) {
+        if ((int) lcp < n_min) {
+            // shaving below the floor would push the family under prefix_family_for's own gate
+            // and strand it, matching nothing ever again
+            SRV_INF("prefix cache: not shaving a family below the %d token floor (a prompt agreed to only %d)\n",
+                    n_min, (int) lcp);
             return;
-        }
-
-        // confirmed: shave the family and let what we hold age out, so the next prefill
-        // through the new boundary captures it
-        if (prompt_cache) {
-            auto * cur = prompt_cache->get_shared(fam->tokens);
-            if (cur) {
-                cur->shared = false;
-            }
         }
 
         SRV_INF("prefix cache: shaved a prefix family from %d to %d tokens (confirmed twice)\n",
                 (int) fam->tokens.size(), (int) lcp);
 
+        // NOTE: what is held stays held, and stays shared. it is released only once a
+        // replacement at the new length is actually in the cache -- see the capture block.
+        // clearing it here destroyed the only copy that existed, on the assumption that the
+        // next prefill through the new boundary would capture it. with warm slots, none does.
         fam->tokens.keep_first(lcp);
-        fam->pending_len = 0;
-        fam->pending_n   = 0;
+
+        // divergence points at or beyond the new boundary say nothing more
+        std::vector<std::pair<size_t, int>> kept;
+
+        for (const auto & p : fam->pending) {
+            if (p.first < lcp) {
+                kept.push_back(p);
+            }
+        }
+
+        fam->pending = std::move(kept);
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
@@ -2069,8 +2110,10 @@ private:
                         slot.capture_prefix_at = n_pfx;
                         SLT_INF(slot, "prefix cache: will capture %d tokens on this prefill\n", n_pfx);
                     } else {
-                        SLT_INF(slot, "prefix cache: not capturing (family %d, prompt agrees %d, slot already has %d)\n",
-                                n_pfx, n_fam, n_slot);
+                        SLT_INF(slot, "prefix cache: not capturing (family %d, prompt agrees %d, slot already has %d)%s\n",
+                                n_pfx, n_fam, n_slot,
+                                n_fam != n_pfx ? " [this prompt diverges inside the family]"
+                                               : " [slot is already past the boundary, no prefill will cross it]");
                     }
                 }
             }
@@ -4187,6 +4230,14 @@ private:
             // while that is provably true, rather than a loop pass later.
             if (params_base.prefix_cache && prompt_cache) {
                 for (auto & slot : slots) {
+                    if (slot.capture_prefix_at > 0 && (int) slot.prompt.n_tokens() > slot.capture_prefix_at) {
+                        // the prefill overshot the boundary. the break in update_slots would
+                        // otherwise stop this slot contributing tokens to any batch, forever
+                        SLT_WRN(slot, "prefix cache: prefill overshot the %d token boundary (now %d), not capturing\n",
+                                slot.capture_prefix_at, (int) slot.prompt.n_tokens());
+                        slot.capture_prefix_at = 0;
+                    }
+
                     if (slot.capture_prefix_at <= 0 || (int) slot.prompt.n_tokens() != slot.capture_prefix_at) {
                         continue;
                     }
@@ -4199,8 +4250,12 @@ private:
                     prompt_cache->mark_next_shared = false;
 
                     if (ok) {
+                        // the replacement is in the cache, so anything it supersedes can go now
+                        const size_t n_ret = prompt_cache->release_shared_superseded(slot.prompt.tokens);
+
                         prompt_cache->flush_to_disk();
-                        SLT_INF(slot, "prefix cache: holding %d tokens as a shared prefix\n", n_pfx);
+                        SLT_INF(slot, "prefix cache: holding %d tokens as a shared prefix (retired %d superseded)\n",
+                                n_pfx, (int) n_ret);
                     } else {
                         SLT_WRN(slot, "prefix cache: could not hold the %d token prefix\n", n_pfx);
                     }

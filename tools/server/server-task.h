@@ -649,6 +649,10 @@ struct server_prompt_cache {
 
     // set immediately before the save that should become a held prefix
     bool        mark_next_shared = false;
+
+    // set when the model cannot rewind a restored state. an entry is then usable only by a
+    // prompt that extends it exactly, however well a longer one matches
+    bool        require_exact_prefix = false;
     size_t      file_seq = 0;
 
     // identifies the model and KV geometry that produced a file. restoring a state written
@@ -700,6 +704,9 @@ struct server_prompt_cache {
     // mark a file as used. NOT called on adoption: a frequently restarted server would
     // otherwise keep dead conversations alive forever
     void touch(const std::string & path) const;
+
+    // drop every held entry that extends `keep`, called once its replacement is in the cache
+    size_t release_shared_superseded(const server_tokens & keep);
 
     // drop entries whose file has aged past the ttl
     size_t expire_stale();

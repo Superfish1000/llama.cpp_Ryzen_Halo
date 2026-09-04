@@ -1957,6 +1957,26 @@ std::vector<server_prompt_cache_state *> server_prompt_cache::get_shared_all() {
     return res;
 }
 
+size_t server_prompt_cache::release_shared_superseded(const server_tokens & keep) {
+    size_t n = 0;
+
+    for (auto it = states.begin(); it != states.end(); ) {
+        const size_t len = it->prompt.tokens.size();
+
+        // only entries that EXTEND the replacement go. a shorter held prefix serves every
+        // prompt a longer one would, so it is never the one to drop
+        if (it->shared && len > keep.size() &&
+            (size_t) it->prompt.tokens.get_common_prefix(keep) == keep.size()) {
+            it = drop(it);
+            n++;
+        } else {
+            ++it;
+        }
+    }
+
+    return n;
+}
+
 bool server_prompt_cache::drop_oldest_unshared() {
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (!it->shared) {
@@ -2120,7 +2140,12 @@ bool server_prompt_cache::promote(server_prompt_cache_state & state) {
     }
 
     f.close();
-    unlink_state(state);
+
+    // a held prefix keeps its file: it will be wanted again, and it has to still be on disk
+    // at the next start. consuming it here is what left nothing to adopt
+    if (!state.shared) {
+        unlink_state(state);
+    }
 
     return true;
 }
@@ -2164,11 +2189,22 @@ size_t server_prompt_cache::n_tokens() const {
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+    // read the flag here rather than at the end: an early return must not leave it armed for
+    // whatever happens to be saved next
+    const bool as_shared = mark_next_shared;
+    mark_next_shared = false;
+
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
+            // a prefix being contained in longer conversations of its own family is the whole
+            // point of holding it, not a reason to refuse it. only an exact duplicate is one
+            if (as_shared && it->prompt.tokens.size() != prompt.tokens.size()) {
+                continue;
+            }
+
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
@@ -2249,9 +2285,6 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
-    const bool as_shared = mark_next_shared;
-    mark_next_shared = false;
-
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
@@ -2311,6 +2344,26 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
+        if (require_exact_prefix) {
+            // this model cannot rewind, so an entry longer than the agreement point is not a
+            // worse choice, it is an impossible one: it restores and is then thrown away when
+            // the partial rewind fails, costing a full read and a full rebuild
+            if (lcp_cur != (int) it->prompt.tokens.size()) {
+                continue;
+            }
+
+            // every survivor has f_keep == 1, so the joint rule below would accept only
+            // whichever came first in list order. rank on coverage instead
+            if (f_sim_cur > f_sim_best) {
+                f_keep_best = f_keep_cur;
+                f_sim_best  = f_sim_cur;
+
+                it_best     = it;
+            }
+
+            continue;
+        }
+
         if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
@@ -2335,9 +2388,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         SRV_INF(" - prompt cache declined: %zu entries, best shares %zu tokens of a %zu token entry,"
-                " prompt is %zu tokens (f_keep = %.3f; needs >= 0.250 and an entry no longer than the prompt)\n",
+                " prompt is %zu tokens (an entry is usable only when the prompt extends it exactly%s)\n",
                 states.size(), best_lcp_seen, best_len_seen, tokens_new.size(),
-                best_len_seen > 0 ? float(best_lcp_seen)/best_len_seen : 0.0f);
+                require_exact_prefix ? "; this model cannot rewind a longer one" : "");
     }
 
     if (it_best != states.end()) {
@@ -2357,6 +2410,16 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             auto & data = it_best->data.main;
 
             const size_t size = data.size();
+
+            if (size == 0) {
+                // tokens but no bytes. restoring this would hand the slot a prompt the memory
+                // does not contain, and the next prefill aborts on an empty sequence
+                SRV_WRN(" - cache entry with %d tokens has no state bytes, dropping it\n",
+                        (int) it_best->prompt.n_tokens());
+                drop(it_best);
+                return false;
+            }
+
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
@@ -2395,11 +2458,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             // ttl measures time since it was last useful, not time since it was written
             touch(it_best->file);
 
-            // promote() consumed the file to read it back; write it out again so the
-            // prefix still survives a restart
-            if (it_best->file.empty() && !it_best->data.main.empty()) {
-                demote(*it_best);
-            }
+            // promote() no longer consumes a held entry's file, so there is nothing to write
+            // back here: the entry ends this call as file-on-disk plus tokens, exactly the
+            // shape load_dir() adopts at the next start
         } else {
             prompt = std::move(it_best->prompt);
 
