@@ -1247,6 +1247,15 @@ private:
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
         }
 
+        // this decides whether a restored cache state can be trimmed to a shorter prompt, which
+        // is the difference between reusing a long conversation and rebuilding it. it was never
+        // reported, so the wrong assumption about it went unnoticed for a long time
+        SRV_INF("sequence removal: %s\n",
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO   ? "unsupported" :
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ? "partial (a cached state can be trimmed freely)" :
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ? "whole sequences only (a cached state can only serve a prompt that extends it)" :
+                                                                        "partial, bounded by the recurrent checkpoints");
+
         // setup slots
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot, params_base.kv_unified ? "true" : "false");
@@ -1411,9 +1420,12 @@ private:
                         params_base.cache_ram_mib, n_ctx, params_base.cache_disk_mib, dir_disk, fingerprint,
                         params_base.cache_disk_ttl_h);
 
-                // an entry may only serve a prompt that extends it exactly unless this model
-                // can rewind a restored state
-                prompt_cache->require_exact_prefix = (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+                // only FULL ("whole sequences only") and NO actually forbid trimming a restored
+                // state. PART and RS can both rewind -- RS within the bound its recurrent
+                // checkpoints give it -- so neither may be told an entry has to be an exact prefix
+                prompt_cache->require_exact_prefix =
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO);
 
                 // pick up what an earlier run of this same model left behind
                 prompt_cache->load_dir();
